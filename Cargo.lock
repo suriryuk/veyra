@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-core",
  "agent-model",
@@ -28,15 +28,17 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-model",
  "agent-security",
  "agent-tools",
  "async-trait",
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -46,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "agent-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -62,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "agent-security"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -78,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-model",
  "agent-security",
@@ -94,6 +96,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
  "walkdir",
 ]
 

@@ -1,4 +1,5 @@
-use crate::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
+use crate::process::run_process;
+use crate::{CommandProfile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 use agent_model::ToolDefinition;
 use agent_security::RiskLevel;
 use async_trait::async_trait;
@@ -9,10 +10,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 use walkdir::WalkDir;
 
 pub fn register_builtin_tools(registry: &mut ToolRegistry) -> Result<(), ToolError> {
@@ -21,8 +18,8 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) -> Result<(), ToolErr
     registry.register(ReadFileRange)?;
     registry.register(GlobFiles)?;
     registry.register(Grep)?;
-    registry.register(GitStatus)?;
-    registry.register(GitDiff)?;
+    crate::git_tools::register(registry)?;
+    crate::cargo_tools::register(registry)?;
     registry.register(PatchFile)?;
     registry.register(WriteFile)?;
     registry.register(RunCommand)?;
@@ -338,46 +335,6 @@ impl Tool for Grep {
     }
 }
 
-struct GitStatus;
-struct GitDiff;
-macro_rules! git_tool {
-    ($ty:ident, $name:literal, $desc:literal, $args:expr) => {
-        #[async_trait]
-        impl Tool for $ty {
-            fn definition(&self) -> ToolDefinition {
-                schema($name, $desc, json!({}), &[])
-            }
-            fn risk(&self, _: &Value) -> Result<RiskLevel, ToolError> {
-                Ok(RiskLevel::Read)
-            }
-            fn validate(&self, v: &Value) -> Result<(), ToolError> {
-                if v.as_object().is_some_and(serde_json::Map::is_empty) {
-                    Ok(())
-                } else {
-                    Err(ToolError::InvalidArguments(
-                        "expected an empty object".to_owned(),
-                    ))
-                }
-            }
-            async fn execute(&self, ctx: &ToolContext, _: Value) -> Result<ToolResult, ToolError> {
-                fixed_command(ctx, "git", $args, $name).await
-            }
-        }
-    };
-}
-git_tool!(
-    GitStatus,
-    "git_status",
-    "Show read-only Git status",
-    &["status", "--short"]
-);
-git_tool!(
-    GitDiff,
-    "git_diff",
-    "Show unstaged Git diff",
-    &["diff", "--no-ext-diff", "--"]
-);
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchArg {
@@ -537,8 +494,29 @@ impl Tool for RunCommand {
     fn validate(&self, v: &Value) -> Result<(), ToolError> {
         let a: CommandArg = serde_json::from_value(v.clone())
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let program = executable_name(&a.program);
         if a.program.trim().is_empty() {
             Err(ToolError::InvalidArguments("program is empty".to_owned()))
+        } else if [
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+        ]
+        .contains(&program.as_str())
+        {
+            Err(ToolError::Policy(
+                "shell interpreters are not supported; use a structured program and args"
+                    .to_owned(),
+            ))
+        } else if program == "git" && is_git_write(&a.args) {
+            Err(ToolError::Policy("Git writes must use the dedicated safe Git tools; push/reset/clean are unsupported".to_owned()))
         } else if a.timeout_seconds == Some(0) {
             Err(ToolError::InvalidArguments(
                 "timeout must be positive".to_owned(),
@@ -550,20 +528,14 @@ impl Tool for RunCommand {
     async fn execute(&self, ctx: &ToolContext, v: Value) -> Result<ToolResult, ToolError> {
         let a: CommandArg = decode(v)?;
         let cwd = ctx.workspace.resolve_existing(&a.working_directory)?;
-        let timeout = a
-            .timeout_seconds
-            .unwrap_or(ctx.limits.command_timeout_seconds)
-            .min(ctx.limits.command_timeout_seconds);
-        run_process(ctx, &a.program, &a.args, &cwd, &a.environment, timeout).await
+        let mut limits = ctx.limits.command_limits(CommandProfile::Default);
+        limits.timeout_seconds = limits.bounded_timeout(a.timeout_seconds);
+        run_process(ctx, &a.program, &a.args, &cwd, &a.environment, &limits).await
     }
 }
 
 fn command_risk(a: &CommandArg) -> RiskLevel {
-    let program = Path::new(&a.program)
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or(&a.program)
-        .to_ascii_lowercase();
+    let program = executable_name(&a.program);
     if ["rm", "sudo", "chmod", "chown", "del", "erase", "rmdir"].contains(&program.as_str()) {
         return RiskLevel::Dangerous;
     }
@@ -584,106 +556,42 @@ fn command_risk(a: &CommandArg) -> RiskLevel {
     RiskLevel::Execute
 }
 
-async fn fixed_command(
-    ctx: &ToolContext,
-    program: &str,
-    args: &[&str],
-    name: &str,
-) -> Result<ToolResult, ToolError> {
-    let args: Vec<String> = args.iter().map(|v| (*v).to_owned()).collect();
-    run_process(
-        ctx,
-        program,
-        &args,
-        ctx.workspace.root(),
-        &BTreeMap::new(),
-        ctx.limits.command_timeout_seconds,
-    )
-    .await
-    .map(|mut result| {
-        result.summary = name.to_owned();
-        result
-    })
+fn executable_name(program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase()
 }
 
-async fn run_process(
-    ctx: &ToolContext,
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    env: &BTreeMap<String, String>,
-    timeout_seconds: u64,
-) -> Result<ToolResult, ToolError> {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|e| ToolError::Execution(e.to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ToolError::Execution("stdout unavailable".to_owned()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ToolError::Execution("stderr unavailable".to_owned()))?;
-    let stdout_task = tokio::spawn(read_stream_limited(stdout, ctx.limits.stdout_limit_bytes));
-    let stderr_task = tokio::spawn(read_stream_limited(stderr, ctx.limits.stderr_limit_bytes));
-    let started = Instant::now();
-    let status = tokio::select! {
-        result = child.wait() => result.map_err(|e| ToolError::Execution(e.to_string()))?,
-        () = tokio::time::sleep(Duration::from_secs(timeout_seconds)) => { let _ = child.kill().await; let _ = child.wait().await; return Err(ToolError::Timeout(timeout_seconds)); },
-        () = ctx.cancellation.cancelled() => { let _ = child.kill().await; let _ = child.wait().await; return Err(ToolError::Cancelled); },
-    };
-    let (stdout, stdout_truncated) = stdout_task
-        .await
-        .map_err(|e| ToolError::Execution(e.to_string()))??;
-    let (stderr, stderr_truncated) = stderr_task
-        .await
-        .map_err(|e| ToolError::Execution(e.to_string()))??;
-    let success = status.success();
-    Ok(ToolResult {
-        content: json!({"exit_code":status.code(),"stdout":stdout,"stderr":stderr}),
-        summary: format!(
-            "command {} ({})",
-            if success { "succeeded" } else { "failed" },
-            status
-        ),
-        truncated: stdout_truncated || stderr_truncated,
-        metadata: json!({"duration_ms":started.elapsed().as_millis(),"success":success}),
-    })
-}
-
-async fn read_stream_limited<R: AsyncRead + Unpin>(
-    mut reader: R,
-    limit: usize,
-) -> Result<(String, bool), ToolError> {
-    let mut kept = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|e| ToolError::Io(e.to_string()))?;
-        if count == 0 {
-            break;
-        }
-        let available = limit.saturating_sub(kept.len());
-        let take = count.min(available);
-        kept.extend_from_slice(&buffer[..take]);
-        if take < count {
-            truncated = true;
-        }
-    }
-    Ok((String::from_utf8_lossy(&kept).into_owned(), truncated))
+fn is_git_write(args: &[String]) -> bool {
+    args.iter()
+        .find(|argument| !argument.starts_with('-'))
+        .is_some_and(|subcommand| {
+            [
+                "add",
+                "am",
+                "apply",
+                "branch",
+                "checkout",
+                "clean",
+                "commit",
+                "merge",
+                "mv",
+                "pull",
+                "push",
+                "rebase",
+                "reset",
+                "restore",
+                "revert",
+                "rm",
+                "stash",
+                "switch",
+                "tag",
+                "update-ref",
+            ]
+            .contains(&subcommand.as_str())
+        })
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -720,6 +628,24 @@ mod tests {
             environment: BTreeMap::new(),
         };
         assert_eq!(command_risk(&a), RiskLevel::Dangerous);
+    }
+    #[test]
+    fn shell_and_git_write_bypasses_are_rejected() {
+        assert!(
+            RunCommand
+                .validate(&json!({"program":"sh","args":["-c","git push"]}))
+                .is_err()
+        );
+        assert!(
+            RunCommand
+                .validate(&json!({"program":"git","args":["push","origin","main"]}))
+                .is_err()
+        );
+        assert!(
+            RunCommand
+                .validate(&json!({"program":"cargo","args":["check"]}))
+                .is_ok()
+        );
     }
     #[test]
     fn write_requires_explicit_overwrite() {
@@ -762,20 +688,21 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let ctx = context(temp.path())?;
         let result = RunCommand
-            .execute(
-                &ctx,
-                json!({"program":"sh","args":["-c","printf 123456789"]}),
-            )
+            .execute(&ctx, json!({"program":"printf","args":["123456789"]}))
             .await?;
         assert!(result.truncated);
-        assert_eq!(result.content["stdout"], "12345");
+        assert!(
+            result.content["stdout"]
+                .as_str()
+                .is_some_and(|output| output.starts_with("12") && output.ends_with("789"))
+        );
         let timeout = RunCommand
             .execute(
                 &ctx,
-                json!({"program":"sh","args":["-c","sleep 2"],"timeout_seconds":1}),
+                json!({"program":"sleep","args":["2"],"timeout_seconds":1}),
             )
-            .await;
-        assert!(matches!(timeout, Err(ToolError::Timeout(1))));
+            .await?;
+        assert_eq!(timeout.content["outcome"], "timeout");
         Ok(())
     }
 }

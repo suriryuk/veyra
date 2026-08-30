@@ -5,11 +5,13 @@ use agent_security::{
     ApprovalDecision, ApprovalProvider, ApprovalRequest, AuditEvent, AuditPhase, AuditSink,
     RiskLevel, SessionId, TaskId, ToolCallId, WorkspaceGuard, approval_fingerprint,
 };
-use agent_tools::{ExecutionLimits, ToolContext, ToolRegistry, ToolResult};
+use agent_tools::{ExecutionLimits, ToolContext, ToolError, ToolRegistry, ToolResult};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
@@ -38,6 +40,37 @@ pub enum StepStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPhase {
+    Discovery,
+    Editing,
+    Verifying,
+    Recovering,
+    Reviewing,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    Compiler,
+    Test,
+    Timeout,
+    PatchConflict,
+    PolicyViolation,
+    Command,
+    Tool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureInfo {
+    pub kind: FailureKind,
+    pub fingerprint: String,
+    pub occurrences: usize,
+    pub replan_required: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStep {
     pub id: Uuid,
@@ -52,6 +85,8 @@ pub struct Observation {
     pub content: Value,
     pub truncated: bool,
     pub is_error: bool,
+    pub workflow_phase: WorkflowPhase,
+    pub failure: Option<FailureInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +101,11 @@ pub struct AgentState {
     pub iteration: usize,
     pub tool_calls: usize,
     pub consecutive_errors: usize,
+    pub workflow_phase: WorkflowPhase,
+    pub change_sequence: usize,
+    pub last_successful_verification: Option<usize>,
+    pub last_diff_review: Option<usize>,
+    pub failure_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +113,7 @@ pub struct AgentLimits {
     pub max_iterations: usize,
     pub max_tool_calls: usize,
     pub max_consecutive_errors: usize,
+    pub max_identical_failures: usize,
 }
 
 impl Default for AgentLimits {
@@ -81,6 +122,7 @@ impl Default for AgentLimits {
             max_iterations: 30,
             max_tool_calls: 50,
             max_consecutive_errors: 3,
+            max_identical_failures: 3,
         }
     }
 }
@@ -99,6 +141,14 @@ pub enum AgentEvent {
     PlanCreated {
         task_id: TaskId,
         steps: Vec<PlanStep>,
+    },
+    WorkflowPhaseChanged {
+        task_id: TaskId,
+        phase: WorkflowPhase,
+    },
+    FailureClassified {
+        task_id: TaskId,
+        failure: FailureInfo,
     },
     ToolRequested {
         call_id: ToolCallId,
@@ -222,6 +272,11 @@ impl AgentRunner {
             iteration: 0,
             tool_calls: 0,
             consecutive_errors: 0,
+            workflow_phase: WorkflowPhase::Discovery,
+            change_sequence: 0,
+            last_successful_verification: None,
+            last_diff_review: None,
+            failure_counts: BTreeMap::new(),
         };
         self.events
             .emit(AgentEvent::PlanCreated {
@@ -291,9 +346,17 @@ impl AgentRunner {
                 let answer = response
                     .content
                     .unwrap_or_else(|| "Task completed without a textual response.".to_owned());
+                if let Some(requirement) = completion_requirement(&state) {
+                    state.messages.push(Message::system(format!(
+                        "Workflow evaluator rejected completion: {requirement}. Continue with the required verification or review before answering."
+                    )));
+                    continue;
+                }
                 if let Some(step) = state.plan.first_mut() {
                     step.status = StepStatus::Completed;
                 }
+                self.set_workflow_phase(&mut state, WorkflowPhase::Completed)
+                    .await;
                 self.set_status(&mut state, AgentStatus::Completed).await;
                 self.events
                     .emit(AgentEvent::TaskCompleted { task_id, answer })
@@ -317,6 +380,9 @@ impl AgentRunner {
                 let observation = self.execute_tool(&mut state, call).await;
                 match observation {
                     Ok(value) => {
+                        let repeated_failure = value.failure.as_ref().is_some_and(|failure| {
+                            failure.occurrences >= self.limits.max_identical_failures
+                        });
                         state.consecutive_errors = if value.is_error {
                             state.consecutive_errors + 1
                         } else {
@@ -326,6 +392,17 @@ impl AgentRunner {
                             serde_json::to_string(&value).unwrap_or_else(|_| value.summary.clone());
                         state.messages.push(Message::tool(model_call_id, content));
                         state.observations.push(value);
+                        if repeated_failure {
+                            return self
+                                .fail(
+                                    &mut state,
+                                    AgentError::Limit(format!(
+                                        "identical failure repeated {} times",
+                                        self.limits.max_identical_failures
+                                    )),
+                                )
+                                .await;
+                        }
                     }
                     Err(error) => return self.fail(&mut state, error).await,
                 }
@@ -390,7 +467,15 @@ impl AgentRunner {
                     error: error.clone(),
                 })
                 .await;
-            return Ok(error_observation(call_id, error));
+            let failure = self
+                .register_failure(state, FailureKind::Tool, &error)
+                .await;
+            return Ok(error_observation(
+                call_id,
+                error,
+                state.workflow_phase,
+                Some(failure),
+            ));
         };
         let validation = tool.validate(&call.arguments);
         let risk_result = tool.risk(&call.arguments);
@@ -420,6 +505,7 @@ impl AgentRunner {
         )
         .await?;
         if let Err(error) = validation.or(risk_result.map(|_| ())) {
+            let kind = failure_kind_for_tool_error(&error);
             let error = error.to_string();
             self.audit(
                 state,
@@ -440,7 +526,13 @@ impl AgentRunner {
                     error: error.clone(),
                 })
                 .await;
-            return Ok(error_observation(call_id, error));
+            let failure = self.register_failure(state, kind, &error).await;
+            return Ok(error_observation(
+                call_id,
+                error,
+                state.workflow_phase,
+                Some(failure),
+            ));
         }
         let request = ApprovalRequest::for_tool(
             call_id,
@@ -500,18 +592,34 @@ impl AgentRunner {
                 content: json!({"denied":true}),
                 truncated: false,
                 is_error: false,
+                workflow_phase: state.workflow_phase,
+                failure: None,
             });
         }
         let current_fingerprint =
             approval_fingerprint(&call.name, &call.arguments, self.workspace.root());
         if current_fingerprint != request.fingerprint {
+            let error = "approval target changed".to_owned();
+            let failure = self
+                .register_failure(state, FailureKind::PolicyViolation, &error)
+                .await;
             return Ok(error_observation(
                 call_id,
-                "approval target changed".to_owned(),
+                error,
+                state.workflow_phase,
+                Some(failure),
             ));
         }
         if let Err(error) = tool.validate(&call.arguments) {
-            return Ok(error_observation(call_id, error.to_string()));
+            let kind = failure_kind_for_tool_error(&error);
+            let error = error.to_string();
+            let failure = self.register_failure(state, kind, &error).await;
+            return Ok(error_observation(
+                call_id,
+                error,
+                state.workflow_phase,
+                Some(failure),
+            ));
         }
         self.set_status(state, AgentStatus::ExecutingTool).await;
         self.events.emit(AgentEvent::ToolStarted { call_id }).await;
@@ -559,13 +667,9 @@ impl AgentRunner {
                         result: result.clone(),
                     })
                     .await;
-                Ok(Observation {
-                    tool_call_id: call_id,
-                    summary: result.summary,
-                    content: result.content,
-                    truncated: result.truncated,
-                    is_error: false,
-                })
+                Ok(self
+                    .observation_from_result(state, call_id, &call.name, &call.arguments, result)
+                    .await)
             }
             Err(error) => {
                 let duration = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -588,9 +692,101 @@ impl AgentRunner {
                         error: error.to_string(),
                     })
                     .await;
-                Ok(error_observation(call_id, error.to_string()))
+                let kind = failure_kind_for_tool_error(&error);
+                let error = error.to_string();
+                let failure = self.register_failure(state, kind, &error).await;
+                Ok(error_observation(
+                    call_id,
+                    error,
+                    state.workflow_phase,
+                    Some(failure),
+                ))
             }
         }
+    }
+
+    async fn observation_from_result(
+        &self,
+        state: &mut AgentState,
+        call_id: ToolCallId,
+        name: &str,
+        arguments: &Value,
+        result: ToolResult,
+    ) -> Observation {
+        let success = result.metadata["success"].as_bool().unwrap_or(true);
+        let failure = if success {
+            None
+        } else {
+            let kind = failure_kind_from_metadata(&result.metadata);
+            let seed = result.metadata["failure_fingerprint"]
+                .as_str()
+                .unwrap_or(&result.summary);
+            Some(self.register_failure(state, kind, seed).await)
+        };
+
+        if success {
+            match name {
+                "patch_file" | "write_file" | "git_checkout" => {
+                    state.change_sequence = state.change_sequence.saturating_add(1);
+                    state.last_successful_verification = None;
+                    state.last_diff_review = None;
+                    self.set_workflow_phase(state, WorkflowPhase::Editing).await;
+                }
+                _ if is_verification_action(name, arguments) => {
+                    state.last_successful_verification = Some(state.change_sequence);
+                    state.last_diff_review = None;
+                    self.set_workflow_phase(state, WorkflowPhase::Verifying)
+                        .await;
+                }
+                "git_diff" => {
+                    state.last_diff_review = Some(state.change_sequence);
+                    self.set_workflow_phase(state, WorkflowPhase::Reviewing)
+                        .await;
+                }
+                _ => {}
+            }
+        }
+
+        Observation {
+            tool_call_id: call_id,
+            summary: result.summary,
+            content: result.content,
+            truncated: result.truncated,
+            is_error: failure.is_some(),
+            workflow_phase: state.workflow_phase,
+            failure,
+        }
+    }
+
+    async fn register_failure(
+        &self,
+        state: &mut AgentState,
+        kind: FailureKind,
+        seed: &str,
+    ) -> FailureInfo {
+        let fingerprint = if seed.len() == 64 && seed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            seed.to_owned()
+        } else {
+            hex::encode(Sha256::digest(format!("{kind:?}:{seed}").as_bytes()))
+        };
+        let occurrences = state.failure_counts.entry(fingerprint.clone()).or_default();
+        *occurrences = occurrences.saturating_add(1);
+        let failure = FailureInfo {
+            kind,
+            fingerprint,
+            occurrences: *occurrences,
+            replan_required: *occurrences >= 2,
+        };
+        self.set_workflow_phase(state, WorkflowPhase::Recovering)
+            .await;
+        self.set_status(state, AgentStatus::Recovering).await;
+        self.events
+            .emit(AgentEvent::FailureClassified {
+                task_id: state.task_id,
+                failure: failure.clone(),
+            })
+            .await;
+        failure
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -640,6 +836,19 @@ impl AgentRunner {
             .await;
     }
 
+    async fn set_workflow_phase(&self, state: &mut AgentState, phase: WorkflowPhase) {
+        if state.workflow_phase == phase {
+            return;
+        }
+        state.workflow_phase = phase;
+        self.events
+            .emit(AgentEvent::WorkflowPhaseChanged {
+                task_id: state.task_id,
+                phase,
+            })
+            .await;
+    }
+
     async fn fail(
         &self,
         state: &mut AgentState,
@@ -667,13 +876,104 @@ impl AgentRunner {
     }
 }
 
-fn error_observation(call_id: ToolCallId, error: String) -> Observation {
+fn completion_requirement(state: &AgentState) -> Option<&'static str> {
+    if state.change_sequence == 0 {
+        return None;
+    }
+    if state.last_successful_verification != Some(state.change_sequence) {
+        return Some("a successful post-change verification is missing");
+    }
+    if state.last_diff_review != Some(state.change_sequence) {
+        return Some("a post-change git_diff review is missing");
+    }
+    None
+}
+
+fn is_verification_action(name: &str, arguments: &Value) -> bool {
+    if matches!(name, "cargo_build" | "cargo_test") {
+        return true;
+    }
+    if name != "run_command" {
+        return false;
+    }
+    let Some(program) = arguments["program"].as_str() else {
+        return false;
+    };
+    let executable = std::path::Path::new(program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(program)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    let args: Vec<String> = arguments["args"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    match executable.as_str() {
+        "cargo" => args.first().is_some_and(|argument| {
+            matches!(
+                argument.as_str(),
+                "build" | "check" | "test" | "clippy" | "fmt"
+            )
+        }),
+        "npm" | "pnpm" | "yarn" => args.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "test" | "build" | "lint" | "typecheck" | "check"
+            )
+        }),
+        "pytest" | "rustc" => true,
+        "python" | "python3" => args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && matches!(pair[1].as_str(), "pytest" | "unittest")),
+        "go" | "dotnet" => args
+            .first()
+            .is_some_and(|argument| matches!(argument.as_str(), "test" | "build")),
+        "mvn" | "mvnw" | "gradle" | "gradlew" | "make" | "ninja" | "cmake" => args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "test" | "build" | "check" | "all")),
+        _ => false,
+    }
+}
+
+fn failure_kind_for_tool_error(error: &ToolError) -> FailureKind {
+    match error {
+        ToolError::Timeout(_) => FailureKind::Timeout,
+        ToolError::Conflict(_) => FailureKind::PatchConflict,
+        ToolError::Policy(_) | ToolError::InvalidArguments(_) => FailureKind::PolicyViolation,
+        ToolError::Execution(_) => FailureKind::Command,
+        ToolError::Io(_) | ToolError::Cancelled => FailureKind::Tool,
+    }
+}
+
+fn failure_kind_from_metadata(metadata: &Value) -> FailureKind {
+    match metadata["failure_kind"].as_str() {
+        Some("compiler") => FailureKind::Compiler,
+        Some("test") => FailureKind::Test,
+        Some("timeout") => FailureKind::Timeout,
+        Some("patch_conflict") => FailureKind::PatchConflict,
+        Some("policy_violation") => FailureKind::PolicyViolation,
+        _ => FailureKind::Command,
+    }
+}
+
+fn error_observation(
+    call_id: ToolCallId,
+    error: String,
+    workflow_phase: WorkflowPhase,
+    failure: Option<FailureInfo>,
+) -> Observation {
     Observation {
         tool_call_id: call_id,
         summary: error.clone(),
         content: json!({"error":error}),
         truncated: false,
         is_error: true,
+        workflow_phase,
+        failure,
     }
 }
 
@@ -762,6 +1062,30 @@ mod tests {
             Ok(ToolResult::text("changed".to_owned(), "changed", false))
         }
     }
+    struct WorkflowTool {
+        name: &'static str,
+        risk: RiskLevel,
+        results: Mutex<Vec<ToolResult>>,
+    }
+    #[async_trait]
+    impl Tool for WorkflowTool {
+        fn definition(&self) -> agent_model::ToolDefinition {
+            agent_model::ToolDefinition::function(self.name, self.name, json!({"type":"object"}))
+        }
+        fn risk(&self, _: &Value) -> Result<RiskLevel, ToolError> {
+            Ok(self.risk)
+        }
+        fn validate(&self, _: &Value) -> Result<(), ToolError> {
+            Ok(())
+        }
+        async fn execute(&self, _: &ToolContext, _: Value) -> Result<ToolResult, ToolError> {
+            self.results
+                .lock()
+                .map_err(|error| ToolError::Execution(error.to_string()))?
+                .pop()
+                .ok_or_else(|| ToolError::Execution("empty workflow result".to_owned()))
+        }
+    }
     struct Null;
     #[async_trait]
     impl AgentEventSink for Null {
@@ -848,5 +1172,171 @@ mod tests {
         assert_eq!(state.observations.len(), 1);
         assert_eq!(state.observations[0].content["denied"], true);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_requires_recovery_verification_and_diff_review()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let response = |name: &str| ModelResponse {
+            content: None,
+            tool_calls: vec![RequestedToolCall {
+                id: format!("call-{name}"),
+                name: name.to_owned(),
+                arguments: json!({}),
+            }],
+            usage: None,
+            finish_reason: FinishReason::ToolCalls,
+        };
+        let final_response = |content: &str| ModelResponse {
+            content: Some(content.to_owned()),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: FinishReason::Stop,
+        };
+        let provider = FakeModel {
+            responses: Mutex::new(vec![
+                final_response("complete"),
+                response("git_diff"),
+                final_response("premature"),
+                response("cargo_build"),
+                response("git_diff"),
+                response("cargo_test"),
+                response("patch_file"),
+                response("cargo_test"),
+                response("patch_file"),
+            ]),
+        };
+        let success = |kind: &str| ToolResult {
+            content: json!({"outcome":"completed"}),
+            summary: format!("{kind} succeeded"),
+            truncated: false,
+            metadata: json!({"kind":kind,"success":true}),
+        };
+        let failure = ToolResult {
+            content: json!({"outcome":"completed"}),
+            summary: "cargo_test failed (test)".to_owned(),
+            truncated: false,
+            metadata: json!({"kind":"cargo_test","success":false,"failure_kind":"test","failure_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(WorkflowTool {
+            name: "patch_file",
+            risk: RiskLevel::Modify,
+            results: Mutex::new(vec![success("patch_file"), success("patch_file")]),
+        })?;
+        registry.register(WorkflowTool {
+            name: "cargo_test",
+            risk: RiskLevel::Execute,
+            results: Mutex::new(vec![success("cargo_test"), failure]),
+        })?;
+        registry.register(WorkflowTool {
+            name: "cargo_build",
+            risk: RiskLevel::Execute,
+            results: Mutex::new(vec![success("cargo_build")]),
+        })?;
+        registry.register(WorkflowTool {
+            name: "git_diff",
+            risk: RiskLevel::Read,
+            results: Mutex::new(vec![success("git_diff"), success("git_diff")]),
+        })?;
+        let runner = AgentRunner::new(AgentRunnerConfig {
+            provider: Arc::new(provider),
+            registry: Arc::new(registry),
+            approver: Arc::new(Allow),
+            audit: Arc::new(Null),
+            events: Arc::new(Null),
+            workspace: WorkspaceGuard::new(temp.path())?,
+            limits: AgentLimits::default(),
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+        });
+        let state = runner.run("fix it").await?;
+        assert_eq!(state.workflow_phase, WorkflowPhase::Completed);
+        assert_eq!(state.change_sequence, 2);
+        assert_eq!(state.last_successful_verification, Some(2));
+        assert_eq!(state.last_diff_review, Some(2));
+        assert!(state.observations.iter().any(|observation| {
+            observation
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.kind == FailureKind::Test)
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_failure_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let failed_call = || ModelResponse {
+            content: None,
+            tool_calls: vec![RequestedToolCall {
+                id: Uuid::new_v4().to_string(),
+                name: "cargo_test".to_owned(),
+                arguments: json!({}),
+            }],
+            usage: None,
+            finish_reason: FinishReason::ToolCalls,
+        };
+        let provider = FakeModel {
+            responses: Mutex::new(vec![failed_call(), failed_call(), failed_call()]),
+        };
+        let failure = || ToolResult {
+            content: json!({"outcome":"completed"}),
+            summary: "same test failure".to_owned(),
+            truncated: false,
+            metadata: json!({"success":false,"failure_kind":"test","failure_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}),
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(WorkflowTool {
+            name: "cargo_test",
+            risk: RiskLevel::Execute,
+            results: Mutex::new(vec![failure(), failure(), failure()]),
+        })?;
+        let runner = AgentRunner::new(AgentRunnerConfig {
+            provider: Arc::new(provider),
+            registry: Arc::new(registry),
+            approver: Arc::new(Allow),
+            audit: Arc::new(Null),
+            events: Arc::new(Null),
+            workspace: WorkspaceGuard::new(temp.path())?,
+            limits: AgentLimits::default(),
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+        });
+        let error = match runner.run("broken").await {
+            Ok(_) => return Err("third identical failure did not stop".into()),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("identical failure repeated 3 times")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_check_commands_count_as_generic_verification() {
+        assert!(!is_verification_action(
+            "run_command",
+            &json!({"program":"cat","args":["src/main.rs"]})
+        ));
+        assert!(!is_verification_action(
+            "run_command",
+            &json!({"program":"find","args":["."]})
+        ));
+        assert!(is_verification_action(
+            "run_command",
+            &json!({"program":"npm","args":["run","typecheck"]})
+        ));
+        assert!(is_verification_action(
+            "run_command",
+            &json!({"program":"cargo","args":["clippy"]})
+        ));
     }
 }

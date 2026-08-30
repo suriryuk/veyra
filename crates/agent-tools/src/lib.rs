@@ -1,4 +1,7 @@
 mod builtins;
+mod cargo_tools;
+mod git_tools;
+mod process;
 
 use agent_model::ToolDefinition;
 use agent_security::{RiskLevel, SessionId, TaskId, ToolCallId, WorkspaceGuard};
@@ -12,6 +15,66 @@ use tokio_util::sync::CancellationToken;
 
 pub use builtins::register_builtin_tools;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandProfile {
+    Default,
+    CargoBuild,
+    CargoTest,
+    Git,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandLimits {
+    pub timeout_seconds: u64,
+    pub stdout_limit_bytes: usize,
+    pub stderr_limit_bytes: usize,
+}
+
+impl CommandLimits {
+    #[must_use]
+    pub fn bounded_timeout(&self, requested: Option<u64>) -> u64 {
+        requested
+            .unwrap_or(self.timeout_seconds)
+            .min(self.timeout_seconds)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandProfiles {
+    pub default: CommandLimits,
+    pub cargo_build: CommandLimits,
+    pub cargo_test: CommandLimits,
+    pub git: CommandLimits,
+}
+
+impl Default for CommandProfiles {
+    fn default() -> Self {
+        Self {
+            default: CommandLimits {
+                timeout_seconds: 120,
+                stdout_limit_bytes: 1_048_576,
+                stderr_limit_bytes: 1_048_576,
+            },
+            cargo_build: CommandLimits {
+                timeout_seconds: 300,
+                stdout_limit_bytes: 2_097_152,
+                stderr_limit_bytes: 2_097_152,
+            },
+            cargo_test: CommandLimits {
+                timeout_seconds: 600,
+                stdout_limit_bytes: 2_097_152,
+                stderr_limit_bytes: 2_097_152,
+            },
+            git: CommandLimits {
+                timeout_seconds: 60,
+                stdout_limit_bytes: 1_048_576,
+                stderr_limit_bytes: 1_048_576,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionLimits {
     pub command_timeout_seconds: u64,
@@ -19,6 +82,7 @@ pub struct ExecutionLimits {
     pub stderr_limit_bytes: usize,
     pub file_read_limit_bytes: usize,
     pub search_result_limit: usize,
+    pub command_profiles: CommandProfiles,
 }
 
 impl Default for ExecutionLimits {
@@ -29,7 +93,27 @@ impl Default for ExecutionLimits {
             stderr_limit_bytes: 1_048_576,
             file_read_limit_bytes: 2_097_152,
             search_result_limit: 500,
+            command_profiles: CommandProfiles::default(),
         }
+    }
+}
+
+impl ExecutionLimits {
+    #[must_use]
+    pub fn command_limits(&self, profile: CommandProfile) -> CommandLimits {
+        let configured = match profile {
+            CommandProfile::Default => &self.command_profiles.default,
+            CommandProfile::CargoBuild => &self.command_profiles.cargo_build,
+            CommandProfile::CargoTest => &self.command_profiles.cargo_test,
+            CommandProfile::Git => &self.command_profiles.git,
+        };
+        let mut value = configured.clone();
+        if profile == CommandProfile::Default {
+            value.timeout_seconds = self.command_timeout_seconds;
+            value.stdout_limit_bytes = self.stdout_limit_bytes;
+            value.stderr_limit_bytes = self.stderr_limit_bytes;
+        }
+        value
     }
 }
 

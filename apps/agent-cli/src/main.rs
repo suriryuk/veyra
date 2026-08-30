@@ -3,7 +3,9 @@ use agent_model::{ModelProvider, OpenAiCompatibleProvider, SamplingConfig};
 use agent_security::{
     ApprovalDecision, ApprovalProvider, ApprovalRequest, JsonlAuditSink, WorkspaceGuard,
 };
-use agent_tools::{ExecutionLimits, ToolRegistry, register_builtin_tools};
+use agent_tools::{
+    CommandLimits, CommandProfiles, ExecutionLimits, ToolRegistry, register_builtin_tools,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -94,6 +96,7 @@ struct AgentSection {
     max_iterations: usize,
     max_consecutive_errors: usize,
     max_tool_calls: usize,
+    max_identical_failures: usize,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -125,6 +128,22 @@ struct ToolsSection {
     stderr_limit_bytes: usize,
     file_read_limit_bytes: usize,
     search_result_limit: usize,
+    command_profiles: CommandProfilesSection,
+}
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct CommandProfilesSection {
+    default: CommandLimitOverrides,
+    cargo_build: CommandLimitOverrides,
+    cargo_test: CommandLimitOverrides,
+    git: CommandLimitOverrides,
+}
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct CommandLimitOverrides {
+    timeout_seconds: Option<u64>,
+    stdout_limit_bytes: Option<usize>,
+    stderr_limit_bytes: Option<usize>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -139,6 +158,7 @@ impl Default for AgentSection {
             max_iterations: 30,
             max_consecutive_errors: 3,
             max_tool_calls: 50,
+            max_identical_failures: 3,
         }
     }
 }
@@ -178,6 +198,7 @@ impl Default for ToolsSection {
             stderr_limit_bytes: 1_048_576,
             file_read_limit_bytes: 2_097_152,
             search_result_limit: 500,
+            command_profiles: CommandProfilesSection::default(),
         }
     }
 }
@@ -230,11 +251,27 @@ impl AppConfig {
         if self.agent.max_iterations == 0
             || self.agent.max_tool_calls == 0
             || self.agent.max_consecutive_errors == 0
+            || self.agent.max_identical_failures == 0
         {
             return Err(CliError::Config("agent limits must be positive".to_owned()));
         }
         if self.model.request_timeout_seconds == 0 || self.tools.command_timeout_seconds == 0 {
             return Err(CliError::Config("timeouts must be positive".to_owned()));
+        }
+        for profile in [
+            &self.tools.command_profiles.default,
+            &self.tools.command_profiles.cargo_build,
+            &self.tools.command_profiles.cargo_test,
+            &self.tools.command_profiles.git,
+        ] {
+            if profile.timeout_seconds == Some(0)
+                || profile.stdout_limit_bytes == Some(0)
+                || profile.stderr_limit_bytes == Some(0)
+            {
+                return Err(CliError::Config(
+                    "command profile limits must be positive".to_owned(),
+                ));
+            }
         }
         if self.model.context_size < 1024 {
             return Err(CliError::Config(
@@ -309,6 +346,17 @@ impl AgentEventSink for CliEvents {
                 if result.truncated { " (truncated)" } else { "" }
             ),
             AgentEvent::ToolFailed { error, .. } => eprintln!("[tool] failed: {error}"),
+            AgentEvent::WorkflowPhaseChanged { phase, .. } => eprintln!("[workflow] {phase:?}"),
+            AgentEvent::FailureClassified { failure, .. } => eprintln!(
+                "[workflow] {:?} failure occurrence {}{}",
+                failure.kind,
+                failure.occurrences,
+                if failure.replan_required {
+                    " — replan required"
+                } else {
+                    ""
+                }
+            ),
             AgentEvent::TaskCompleted { answer, .. } => {
                 if self.streamed.swap(false, Ordering::Relaxed) {
                     println!();
@@ -360,7 +408,7 @@ async fn main() -> Result<(), CliError> {
 }
 
 async fn chat(config: &AppConfig) -> Result<(), CliError> {
-    println!("Veyra v0.1 — enter a task, or /quit to exit.");
+    println!("Veyra v0.2 — enter a task, or /quit to exit.");
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -419,6 +467,8 @@ async fn run_task(config: &AppConfig, task: String) -> Result<(), CliError> {
             signal.cancel();
         }
     });
+    let command_profiles = command_profiles(config);
+    let default_command = command_profiles.default.clone();
     let runner = AgentRunner::new(AgentRunnerConfig {
         provider,
         registry,
@@ -430,13 +480,15 @@ async fn run_task(config: &AppConfig, task: String) -> Result<(), CliError> {
             max_iterations: config.agent.max_iterations,
             max_tool_calls: config.agent.max_tool_calls,
             max_consecutive_errors: config.agent.max_consecutive_errors,
+            max_identical_failures: config.agent.max_identical_failures,
         },
         execution_limits: ExecutionLimits {
-            command_timeout_seconds: config.tools.command_timeout_seconds,
-            stdout_limit_bytes: config.tools.stdout_limit_bytes,
-            stderr_limit_bytes: config.tools.stderr_limit_bytes,
+            command_timeout_seconds: default_command.timeout_seconds,
+            stdout_limit_bytes: default_command.stdout_limit_bytes,
+            stderr_limit_bytes: default_command.stderr_limit_bytes,
             file_read_limit_bytes: config.tools.file_read_limit_bytes,
             search_result_limit: config.tools.search_result_limit,
+            command_profiles,
         },
         sampling: SamplingConfig {
             temperature: config.model.sampling.temperature,
@@ -449,6 +501,43 @@ async fn run_task(config: &AppConfig, task: String) -> Result<(), CliError> {
     });
     runner.run(task).await?;
     Ok(())
+}
+
+fn command_profiles(config: &AppConfig) -> CommandProfiles {
+    let defaults = CommandProfiles::default();
+    let flat = CommandLimits {
+        timeout_seconds: config.tools.command_timeout_seconds,
+        stdout_limit_bytes: config.tools.stdout_limit_bytes,
+        stderr_limit_bytes: config.tools.stderr_limit_bytes,
+    };
+    CommandProfiles {
+        default: apply_command_overrides(flat, &config.tools.command_profiles.default),
+        cargo_build: apply_command_overrides(
+            defaults.cargo_build,
+            &config.tools.command_profiles.cargo_build,
+        ),
+        cargo_test: apply_command_overrides(
+            defaults.cargo_test,
+            &config.tools.command_profiles.cargo_test,
+        ),
+        git: apply_command_overrides(defaults.git, &config.tools.command_profiles.git),
+    }
+}
+
+fn apply_command_overrides(
+    mut limits: CommandLimits,
+    overrides: &CommandLimitOverrides,
+) -> CommandLimits {
+    if let Some(value) = overrides.timeout_seconds {
+        limits.timeout_seconds = value;
+    }
+    if let Some(value) = overrides.stdout_limit_bytes {
+        limits.stdout_limit_bytes = value;
+    }
+    if let Some(value) = overrides.stderr_limit_bytes {
+        limits.stderr_limit_bytes = value;
+    }
+    limits
 }
 
 fn registry() -> Result<ToolRegistry, agent_tools::ToolError> {

@@ -6,5 +6,6 @@
 .env
 llama.cpp/
 models/
-docs/
 llama-server
+docs/
+docs/

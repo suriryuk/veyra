@@ -2,6 +2,7 @@
 max_iterations = 30
 max_consecutive_errors = 3
 max_tool_calls = 50
+max_identical_failures = 3
 
 [model]
 base_url = "http://127.0.0.1:8080/v1"
@@ -25,7 +26,21 @@ stderr_limit_bytes = 1048576
 file_read_limit_bytes = 2097152
 search_result_limit = 500
 
+[tools.command_profiles.cargo_build]
+timeout_seconds = 300
+stdout_limit_bytes = 2097152
+stderr_limit_bytes = 2097152
+
+[tools.command_profiles.cargo_test]
+timeout_seconds = 600
+stdout_limit_bytes = 2097152
+stderr_limit_bytes = 2097152
+
+[tools.command_profiles.git]
+timeout_seconds = 60
+stdout_limit_bytes = 1048576
+stderr_limit_bytes = 1048576
+
 [logging]
 level = "info"
 directory = "logs"
-

@@ -1,15 +1,15 @@
-# Veyra v0.1
+# Veyra v0.2
 
-Veyra is a local coding-agent runtime written in Rust. It connects to an
-OpenAI-compatible `llama-server`, streams model output, and lets the model inspect
-a configured workspace. File changes and process execution are always bound to an
-exact, one-time user approval.
+Veyra is a safe local coding-agent runtime written in Rust. It connects to an
+OpenAI-compatible `llama-server`, streams model output, inspects a configured
+workspace, applies approved edits, classifies Rust build/test failures, replans,
+and reviews the final Git diff before completing a changed task.
 
 ## Requirements
 
-- Windows 11 with WSL2 Ubuntu 24.04 (the reference environment), or Linux
-- Rust 1.85.0; `rust-toolchain.toml` installs the required formatter and clippy
-- Git for the read-only Git tools
+- Windows 11 with WSL2 Ubuntu 24.04 (reference environment), or Linux
+- Rust 1.85.0; `rust-toolchain.toml` installs rustfmt and clippy
+- Git and Cargo for the v0.2 coding workflow
 - A running OpenAI-compatible server for interactive use
 
 The repository uses Cargo's Rust-version fallback resolver and commits
@@ -24,13 +24,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The tests include a local mock HTTP/SSE server; downloading a model is not needed
-for the automated test suite.
+The automated suite uses a mock HTTP/SSE server, temporary Git repositories,
+and a temporary Rust fixture. Downloading a model is not required.
 
 ## Start llama-server
 
-Download `Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf`, build llama.cpp with
-CUDA support, and run from WSL2:
+From WSL2, start the configured Qwen3-Coder model:
 
 ```bash
 ./llama-server \
@@ -41,27 +40,46 @@ CUDA support, and run from WSL2:
   --batch-size 2048 --ubatch-size 512 --parallel 1
 ```
 
-Check connectivity with:
-
-```bash
-cargo run -p agent-cli -- models status
-```
+Check connectivity with `cargo run -p agent-cli -- models status`.
 
 ## Configuration
 
 The default file is [`config/agent.toml`](config/agent.toml). Precedence from
-highest to lowest is CLI flags, `VEYRA_` environment variables, the selected TOML
-file, the default TOML file, and built-in safe defaults.
+highest to lowest is CLI flags, supported `VEYRA_` environment variables, the
+selected TOML file, the default file, and built-in safe defaults.
 
-Supported environment overrides are `VEYRA_MODEL_BASE_URL`, `VEYRA_MODEL_NAME`,
-`VEYRA_WORKSPACE_ROOT`, and `VEYRA_LOG_LEVEL`. Use another file or workspace with
-`--config <path>` and `--workspace <path>`. Relative workspace paths are resolved
-from the process working directory.
+```toml
+[agent]
+max_iterations = 30
+max_consecutive_errors = 3
+max_tool_calls = 50
+max_identical_failures = 3
+
+[tools]
+command_timeout_seconds = 120
+stdout_limit_bytes = 1048576
+stderr_limit_bytes = 1048576
+
+[tools.command_profiles.cargo_build]
+timeout_seconds = 300
+
+[tools.command_profiles.cargo_test]
+timeout_seconds = 600
+
+[tools.command_profiles.git]
+timeout_seconds = 60
+```
+
+Each profile can set `timeout_seconds`, `stdout_limit_bytes`, and
+`stderr_limit_bytes`. A Tool request may lower but never raise its configured
+timeout. Existing v0.1 configuration files remain valid. Supported environment
+overrides are `VEYRA_MODEL_BASE_URL`, `VEYRA_MODEL_NAME`,
+`VEYRA_WORKSPACE_ROOT`, and `VEYRA_LOG_LEVEL`.
 
 ## CLI
 
 ```bash
-veyra                                      # same as `veyra chat`
+veyra
 veyra chat
 veyra run "inspect this project and fix the failing test"
 veyra models status
@@ -69,63 +87,103 @@ veyra tools list
 veyra config check
 ```
 
-`chat` starts a prompt loop; use `/quit`, `/exit`, or EOF to leave. A task first
-checks model health. Model tokens are printed as they arrive, tool observations
-are sent back to the model, and the loop stops at the configured iteration,
-tool-call, or consecutive-error limit.
+`chat` starts a prompt loop; use `/quit`, `/exit`, or EOF to leave. Console input
+supports UTF-8 and Windows-949/CP949 Korean text. Model tokens stream immediately,
+while workflow, Tool, and failure-classification events are shown on stderr.
 
-Console input is decoded as UTF-8 first and falls back to Windows-949/CP949 for
-Korean terminals. To inspect a directory outside the default `workspace`, select
-it when starting Veyra, for example `veyra --workspace ~/algorithm chat`; paths
-requested by the model remain confined to that selected workspace.
+## v0.2 coding workflow
+
+For tasks that change files, Veyra tracks:
+
+```text
+Discovery → Editing → Verifying → Recovering (when needed) → Reviewing → Completed
+```
+
+After the last file change, a successful `cargo_build`, `cargo_test`, or recognized
+structured build/test/lint command is required. A later `git_diff` review is also
+required before the Core accepts the model's final response. Compiler diagnostics,
+test failures, timeouts, patch conflicts, policy violations, and generic command
+failures are normalized. A repeated fingerprint requires replanning on its second
+occurrence and terminates safely on its third occurrence by default.
+
+The final response must identify changed files, checks performed, and remaining
+risks. Approval denial is treated as a user decision, not a failure.
+
+In a non-Git workspace, `git_diff` returns a successful `review_unavailable`
+observation instead of trapping the workflow; the final response must disclose that
+no repository diff could be reviewed.
 
 ## Tools and approval policy
 
-Read-only tools run automatically: `list_directory`, `read_file`,
-`read_file_range`, `glob`, `grep`, `git_status`, and `git_diff`.
+Read-only tools run automatically:
 
-State-changing tools require `Allow once` or `Deny` every time:
+- Workspace: `list_directory`, `read_file`, `read_file_range`, `glob`, `grep`
+- Git: `git_status`, `git_diff`, `git_log`, `git_show`, and branch listing
 
-- `patch_file` applies a unified patch and can bind it to `expected_sha256`.
-- `write_file` creates files; replacing an existing file additionally requires
-  `overwrite=true` and can verify `expected_sha256`.
-- `run_command` accepts a program, argument array, workspace-relative working
-  directory, bounded timeout, and explicit environment map. It never invokes a
-  shell implicitly.
+State-changing and process tools require an exact one-time approval:
 
-Risk 3 commands such as deletion, privilege changes, destructive Git operations,
-or network mutation show a prominent warning but can run only after exact
-one-time approval. Approval is bound to the tool, complete JSON arguments, and
-canonical workspace. Changing any of them invalidates the decision.
+- `patch_file` and `write_file`
+- `cargo_build` and `cargo_test`
+- structured `run_command`
+- branch creation/switching, `git_commit`, and `git_checkpoint`
 
-All file targets and symlink destinations must stay within the canonical
-workspace. Commands have no interactive stdin or background-daemon support.
-Timeout cancellation kills the direct child and performs best-effort cleanup;
-platform-specific descendant processes may survive if they detach themselves.
+`git_diff` supports working, staged, base-revision, and path-scoped views. The
+default working-tree review adds bounded pseudo-diffs for untracked, non-ignored
+text files and identifies binary untracked files, so an unborn repository cannot
+silently pass review with an empty diff.
+`git_branch` only lists or creates branches. `git_checkout` only switches branches
+and refuses a dirty worktree. `git_commit` commits explicit paths only and disables
+repository hooks; it does not amend or include unrelated staged changes.
 
-## Logs and audit
+`git_checkpoint` saves tracked staged/unstaged changes under
+`refs/veyra/checkpoints/<UUID>` without changing HEAD, the current branch, index,
+or worktree. Untracked files are deliberately excluded and reported. It refuses an
+empty tracked snapshot.
 
-Human-readable and structured rolling logs are written under `logs/`. Every tool
-request creates correlated append-only records in `logs/audit.jsonl`, including
-session/task/call IDs, redacted arguments, risk, approval, duration, truncation,
-and final status. Keys containing tokens, passwords, API keys, authorization, or
-secrets and Bearer values are masked.
+Shell interpreters and Git writes through `run_command` are rejected. Remote push,
+reset, clean, path checkout, forced branch operations, and other destructive Git
+automation are not supported in v0.2. Structured command timeout/cancellation
+terminates a Unix process group or the Windows process tree, then reports a bounded
+head/tail of stdout and stderr.
 
-## Architecture
+All paths and symlink destinations must remain inside the canonical workspace.
+Approval is bound to Tool name, complete JSON arguments, and workspace; changing
+any of them invalidates the decision.
 
-- `agent-core`: bounded state machine, events, observations, and orchestration
+## Dirty worktrees and recovery
+
+Inspect `git_status` before editing. If tracked user changes exist, create an
+approved checkpoint before modifying them, never as a finalization step. Do not
+commit unless the user explicitly requested it. Do not assume untracked files are
+recoverable from a checkpoint. Branch switching is intentionally blocked until
+the worktree is clean. Patch hash/context conflicts are returned as recoverable
+observations so the agent can reread the target and create a fresh minimal patch.
+
+## Logs and architecture
+
+Human-readable and structured rolling logs are written under `logs/`. Every Tool
+request creates correlated append-only records in `logs/audit.jsonl`, with secrets
+redacted from arguments and summaries.
+
+- `agent-core`: bounded loop, workflow evaluator, failure fingerprints, events
 - `agent-model`: provider contract and OpenAI-compatible SSE adapter
-- `agent-tools`: registry and the ten native v0.1 tools
-- `agent-security`: IDs, workspace guard, risk/approval, redaction, JSONL audit
-- `agent-cli`: configuration, composition root, rendering, and approval prompt
+- `agent-tools`: workspace, Git, Cargo, command, output, and process-tree adapters
+- `agent-security`: workspace guard, risk/approval, redaction, JSONL audit
+- `agent-cli`: configuration, composition root, rendering, approval prompt
 
 Session persistence, Web/TUI, MCP/browser automation, document/vision support,
-Git write workflows, `Allow Always`, and advanced retrieval are intentionally
-outside v0.1.
+remote Git operations, `Allow Always`, and advanced retrieval remain out of scope.
 
 ## Verification status
 
-On 2026-08-30 the workspace passed build, formatting, strict clippy, all automated
-tests, `config check`, and `tools list` under WSL2 with Rust 1.85.0. The mock SSE
-path is automated. A real Qwen/llama-server smoke test remains conditional on the
-model runtime being available.
+Veyra v0.1.0 was completed and manually verified with Qwen3-Coder/llama-server on
+2026-08-30. Veyra v0.2.0 adds 31 automated tests covering the v0.1 contracts plus
+workflow completion gating, identical-failure termination, real Cargo compiler/test
+classification, Git injection/dirty/checkpoint/path-scoped commit behavior, hook
+suppression, bounded output, and descendant process termination. The automated
+workspace quality gates pass under WSL2 Ubuntu 24.04 with Rust 1.85.0.
+The live Qwen3-Coder/llama-server health and read-only Tool-calling smoke test also
+passed: the model read `Cargo.toml`, reported `0.2.0`, checked Git status, and made
+no changes.
+
+See [`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md) for release details.

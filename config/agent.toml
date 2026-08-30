@@ -1,0 +1,31 @@
+[agent]
+max_iterations = 30
+max_consecutive_errors = 3
+max_tool_calls = 50
+
+[model]
+base_url = "http://127.0.0.1:8080/v1"
+model = "Qwen3-Coder-30B-A3B-Instruct"
+context_size = 32768
+request_timeout_seconds = 300
+
+[model.sampling]
+temperature = 0.3
+top_p = 0.8
+top_k = 20
+repeat_penalty = 1.05
+
+[security]
+workspace_root = "workspace"
+
+[tools]
+command_timeout_seconds = 120
+stdout_limit_bytes = 1048576
+stderr_limit_bytes = 1048576
+file_read_limit_bytes = 2097152
+search_result_limit = 500
+
+[logging]
+level = "info"
+directory = "logs"
+

@@ -1,0 +1,9 @@
+*.txt
+/target/
+/logs/
+/workspace/
+*.log
+.env
+llama.cpp/
+models/
+docs/

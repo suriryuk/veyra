@@ -21,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 diffy = "0.4"
 eventsource-stream = "0.2"
+encoding_rs = "0.8"
 futures-util = "0.3"
 globset = "0.4"
 hex = "0.4"
@@ -48,4 +49,3 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
-

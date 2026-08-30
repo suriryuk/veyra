@@ -74,6 +74,11 @@ checks model health. Model tokens are printed as they arrive, tool observations
 are sent back to the model, and the loop stops at the configured iteration,
 tool-call, or consecutive-error limit.
 
+Console input is decoded as UTF-8 first and falls back to Windows-949/CP949 for
+Korean terminals. To inspect a directory outside the default `workspace`, select
+it when starting Veyra, for example `veyra --workspace ~/algorithm chat`; paths
+requested by the model remain confined to that selected workspace.
+
 ## Tools and approval policy
 
 Read-only tools run automatically: `list_directory`, `read_file`,

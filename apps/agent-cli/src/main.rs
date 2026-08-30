@@ -9,7 +9,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -268,9 +268,8 @@ impl ApprovalProvider for CliApprover {
         }
         eprint!("Allow once? [y/N] ");
         let _ = io::stderr().flush();
-        let mut input = String::new();
-        let allowed = io::stdin().read_line(&mut input).is_ok()
-            && matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        let input = read_console_line().ok().flatten().unwrap_or_default();
+        let allowed = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
         if allowed {
             ApprovalDecision::AllowedOnce {
                 decided_at: Utc::now(),
@@ -365,10 +364,9 @@ async fn chat(config: &AppConfig) -> Result<(), CliError> {
     loop {
         print!("> ");
         io::stdout().flush()?;
-        let mut task = String::new();
-        if io::stdin().read_line(&mut task)? == 0 {
+        let Some(task) = read_console_line()? else {
             break;
-        }
+        };
         let task = task.trim();
         if task.is_empty() {
             continue;
@@ -381,6 +379,30 @@ async fn chat(config: &AppConfig) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn read_console_line() -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let count = io::stdin().lock().read_until(b'\n', &mut bytes)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    decode_console_input(&bytes).map(Some)
+}
+
+fn decode_console_input(bytes: &[u8]) -> io::Result<String> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.to_owned());
+    }
+    encoding_rs::EUC_KR
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(|text| text.into_owned())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "console input is neither UTF-8 nor Windows-949",
+            )
+        })
 }
 
 async fn run_task(config: &AppConfig, task: String) -> Result<(), CliError> {
@@ -466,5 +488,22 @@ mod tests {
         let mut config = AppConfig::default();
         config.agent.max_iterations = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn console_input_accepts_utf8_korean() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            decode_console_input("한국어 입력\n".as_bytes())?,
+            "한국어 입력\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn console_input_accepts_windows_949_korean() -> Result<(), Box<dyn std::error::Error>> {
+        let (bytes, _, had_errors) = encoding_rs::EUC_KR.encode("한국어 입력\n");
+        assert!(!had_errors);
+        assert_eq!(decode_console_input(&bytes)?, "한국어 입력\n");
+        Ok(())
     }
 }

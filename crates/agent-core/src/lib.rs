@@ -1,5 +1,10 @@
+use agent_context::{
+    ContextInput, ContextManager, ContextProfile, ContextReport, RepositoryRetriever,
+    RetrievalReport, WorkspaceRetriever,
+};
 use agent_model::{
     Message, ModelEventSink, ModelProvider, ModelRequest, RequestedToolCall, SamplingConfig,
+    TokenUsage,
 };
 use agent_security::{
     ApprovalDecision, ApprovalProvider, ApprovalRequest, AuditEvent, AuditPhase, AuditSink,
@@ -150,6 +155,19 @@ pub enum AgentEvent {
         task_id: TaskId,
         failure: FailureInfo,
     },
+    ContextBuilt {
+        task_id: TaskId,
+        report: ContextReport,
+        retrieval: RetrievalReport,
+    },
+    ContextUsageObserved {
+        task_id: TaskId,
+        profile: agent_context::ContextProfileName,
+        estimated_prompt_tokens: usize,
+        usage: Option<TokenUsage>,
+        estimation_delta: Option<i64>,
+        overflow_retry: bool,
+    },
     ToolRequested {
         call_id: ToolCallId,
         name: String,
@@ -193,6 +211,10 @@ pub trait AgentEventSink: Send + Sync {
 pub enum AgentError {
     #[error("model failed: {0}")]
     Model(String),
+    #[error("context failed: {0}")]
+    Context(String),
+    #[error("model context overflowed after one compact retry: {0}")]
+    ContextOverflow(String),
     #[error("unknown tool: {0}")]
     UnknownTool(String),
     #[error("tool failed: {0}")]
@@ -215,6 +237,7 @@ pub struct AgentRunner {
     limits: AgentLimits,
     execution_limits: ExecutionLimits,
     sampling: SamplingConfig,
+    context: ContextManager,
     system_prompt: String,
     cancellation: CancellationToken,
 }
@@ -229,6 +252,7 @@ pub struct AgentRunnerConfig {
     pub limits: AgentLimits,
     pub execution_limits: ExecutionLimits,
     pub sampling: SamplingConfig,
+    pub context_profile: ContextProfile,
     pub system_prompt: String,
     pub cancellation: CancellationToken,
 }
@@ -246,6 +270,7 @@ impl AgentRunner {
             limits: config.limits,
             execution_limits: config.execution_limits,
             sampling: config.sampling,
+            context: ContextManager::new(config.context_profile),
             system_prompt: config.system_prompt,
             cancellation: config.cancellation,
         }
@@ -286,6 +311,18 @@ impl AgentRunner {
             .await;
         self.set_status(&mut state, AgentStatus::Thinking).await;
 
+        let retrieval = WorkspaceRetriever::new(self.workspace.root())
+            .retrieve(
+                &state.task,
+                match self.context.profile().name {
+                    agent_context::ContextProfileName::Large => 128,
+                    _ => 64,
+                },
+            )
+            .map_err(|error| AgentError::Context(error.to_string()))?;
+        let sources = retrieval.snippets;
+        let retrieval_report = retrieval.report;
+
         loop {
             if self.cancellation.is_cancelled() {
                 return self.fail(&mut state, AgentError::Cancelled).await;
@@ -306,21 +343,83 @@ impl AgentRunner {
                 task_id,
                 sink: self.events.as_ref(),
             };
-            let response = self
-                .provider
-                .complete(
-                    ModelRequest {
-                        messages: state.messages.clone(),
-                        tools: self.registry.definitions(),
-                        sampling: self.sampling.clone(),
-                        max_output_tokens: None,
-                    },
-                    &token_sink,
-                )
-                .await;
+            let tools = self.registry.definitions();
+            let plan = state
+                .plan
+                .iter()
+                .map(|step| format!("- [{:?}] {}", step.status, step.description))
+                .collect::<Vec<_>>();
+            let mut overflow_retry = false;
+            let (response, context_report) = loop {
+                let built = self
+                    .context
+                    .build(ContextInput {
+                        system_prompt: &self.system_prompt,
+                        task: &state.task,
+                        plan: &plan,
+                        history: &state.messages,
+                        sources: &sources,
+                        tools: &tools,
+                        aggressive: overflow_retry,
+                    })
+                    .map_err(|error| AgentError::Context(error.to_string()))?;
+                self.events
+                    .emit(AgentEvent::ContextBuilt {
+                        task_id,
+                        report: built.report.clone(),
+                        retrieval: retrieval_report.clone(),
+                    })
+                    .await;
+                let report = built.report;
+                let response = self
+                    .provider
+                    .complete(
+                        ModelRequest {
+                            messages: built.messages,
+                            tools: tools.clone(),
+                            sampling: self.sampling.clone(),
+                            max_output_tokens: Some(built.max_output_tokens),
+                        },
+                        &token_sink,
+                    )
+                    .await;
+                if response
+                    .as_ref()
+                    .is_err_and(agent_model::ModelError::is_context_overflow)
+                {
+                    if overflow_retry {
+                        let error = response.err().map_or_else(
+                            || "unknown context overflow".to_owned(),
+                            |error| error.to_string(),
+                        );
+                        return self
+                            .fail(&mut state, AgentError::ContextOverflow(error))
+                            .await;
+                    }
+                    overflow_retry = true;
+                    continue;
+                }
+                break (response, report);
+            };
             let response = match response {
                 Ok(value) => {
                     state.consecutive_errors = 0;
+                    let actual_prompt_tokens =
+                        value.usage.as_ref().and_then(|usage| usage.prompt_tokens);
+                    let estimation_delta = actual_prompt_tokens.map(|actual| {
+                        i64::try_from(actual).unwrap_or(i64::MAX)
+                            - i64::try_from(context_report.usage.prompt_tokens).unwrap_or(i64::MAX)
+                    });
+                    self.events
+                        .emit(AgentEvent::ContextUsageObserved {
+                            task_id,
+                            profile: context_report.profile,
+                            estimated_prompt_tokens: context_report.usage.prompt_tokens,
+                            usage: value.usage.clone(),
+                            estimation_delta,
+                            overflow_retry,
+                        })
+                        .await;
                     value
                 }
                 Err(error) => {
@@ -1000,7 +1099,7 @@ mod tests {
     use agent_security::SecurityError;
     use agent_tools::{Tool, ToolError};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FakeModel {
         responses: Mutex<Vec<ModelResponse>>,
@@ -1098,6 +1197,124 @@ mod tests {
         }
     }
 
+    struct OverflowModel {
+        calls: AtomicUsize,
+        always: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for OverflowModel {
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _: &dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.max_output_tokens, Some(2_048));
+            if self.always || call == 0 {
+                return Err(ModelError::Http {
+                    status: 400,
+                    body: "prompt exceeds the available context size".to_owned(),
+                });
+            }
+            Ok(ModelResponse {
+                content: Some("recovered".to_owned()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    prompt_tokens: Some(100),
+                    completion_tokens: Some(5),
+                    total_tokens: Some(105),
+                }),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn health(&self) -> Result<ModelHealth, ModelError> {
+            Ok(ModelHealth {
+                available: true,
+                detail: "ok".to_owned(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ContextEvents {
+        built: AtomicUsize,
+        usage: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentEventSink for ContextEvents {
+        async fn emit(&self, event: AgentEvent) {
+            match event {
+                AgentEvent::ContextBuilt { .. } => {
+                    self.built.fetch_add(1, Ordering::SeqCst);
+                }
+                AgentEvent::ContextUsageObserved { .. } => {
+                    self.usage.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn context_runner(
+        root: &std::path::Path,
+        provider: Arc<dyn ModelProvider>,
+        events: Arc<dyn AgentEventSink>,
+    ) -> Result<AgentRunner, Box<dyn std::error::Error>> {
+        Ok(AgentRunner::new(AgentRunnerConfig {
+            provider,
+            registry: Arc::new(ToolRegistry::new()),
+            approver: Arc::new(Allow),
+            audit: Arc::new(Null),
+            events,
+            workspace: WorkspaceGuard::new(root)?,
+            limits: AgentLimits::default(),
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn context_overflow_is_compacted_and_retried_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let provider = Arc::new(OverflowModel {
+            calls: AtomicUsize::new(0),
+            always: false,
+        });
+        let events = Arc::new(ContextEvents::default());
+        let runner = context_runner(temp.path(), provider.clone(), events.clone())?;
+        let state = runner.run("answer briefly").await?;
+        assert_eq!(state.status, AgentStatus::Completed);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(events.built.load(Ordering::SeqCst), 2);
+        assert_eq!(events.usage.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_context_overflow_fails_without_general_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let provider = Arc::new(OverflowModel {
+            calls: AtomicUsize::new(0),
+            always: true,
+        });
+        let runner = context_runner(temp.path(), provider.clone(), Arc::new(Null))?;
+        let error = match runner.run("answer briefly").await {
+            Ok(_) => return Err("overflow unexpectedly succeeded".into()),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AgentError::ContextOverflow(_)));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn final_response_completes_single_step() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -1119,6 +1336,7 @@ mod tests {
             limits: AgentLimits::default(),
             execution_limits: ExecutionLimits::default(),
             sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
         });
@@ -1164,6 +1382,7 @@ mod tests {
             limits: AgentLimits::default(),
             execution_limits: ExecutionLimits::default(),
             sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
         });
@@ -1250,6 +1469,7 @@ mod tests {
             limits: AgentLimits::default(),
             execution_limits: ExecutionLimits::default(),
             sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
         });
@@ -1305,6 +1525,7 @@ mod tests {
             limits: AgentLimits::default(),
             execution_limits: ExecutionLimits::default(),
             sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
         });

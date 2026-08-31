@@ -16,6 +16,9 @@ top_p = 0.8
 top_k = 20
 repeat_penalty = 1.05
 
+[context]
+profile = "default"
+
 [security]
 workspace_root = "workspace"
 

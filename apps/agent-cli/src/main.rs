@@ -1,3 +1,4 @@
+use agent_context::ContextProfile;
 use agent_core::{AgentEvent, AgentEventSink, AgentLimits, AgentRunner, AgentRunnerConfig};
 use agent_model::{ModelProvider, OpenAiCompatibleProvider, SamplingConfig};
 use agent_security::{
@@ -8,7 +9,7 @@ use agent_tools::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -28,6 +29,8 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long, global = true)]
     workspace: Option<PathBuf>,
+    #[arg(long, global = true, value_enum)]
+    context_profile: Option<ContextProfileArg>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -65,6 +68,13 @@ enum ConfigCommand {
     Check,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContextProfileArg {
+    Default,
+    Large,
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error("configuration error: {0}")]
@@ -86,9 +96,15 @@ enum CliError {
 struct AppConfig {
     agent: AgentSection,
     model: ModelSection,
+    context: Option<ContextSection>,
     security: SecuritySection,
     tools: ToolsSection,
     logging: LoggingSection,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ContextSection {
+    profile: ContextProfileArg,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -159,6 +175,13 @@ impl Default for AgentSection {
             max_consecutive_errors: 3,
             max_tool_calls: 50,
             max_identical_failures: 3,
+        }
+    }
+}
+impl Default for ContextSection {
+    fn default() -> Self {
+        Self {
+            profile: ContextProfileArg::Default,
         }
     }
 }
@@ -283,6 +306,18 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    fn resolved_context_profile(
+        &self,
+        override_profile: Option<ContextProfileArg>,
+    ) -> ContextProfile {
+        match override_profile.or_else(|| self.context.as_ref().map(|context| context.profile)) {
+            Some(ContextProfileArg::Default) => ContextProfile::default_32k(),
+            Some(ContextProfileArg::Large) => ContextProfile::large_65k(),
+            None if self.model.context_size == 32_768 => ContextProfile::default_32k(),
+            None => ContextProfile::legacy(self.model.context_size),
+        }
+    }
 }
 
 struct CliApprover;
@@ -357,6 +392,36 @@ impl AgentEventSink for CliEvents {
                     ""
                 }
             ),
+            AgentEvent::ContextBuilt {
+                report, retrieval, ..
+            } => eprintln!(
+                "[context] profile={} prompt~{}/{} output={} sources={}/{} messages={} compressed={} retrieval={}",
+                report.profile.as_str(),
+                report.usage.prompt_tokens,
+                report.usage.input_limit,
+                report.usage.output_reserve,
+                report.selected_sources,
+                report.selected_sources + report.dropped_sources,
+                report.selected_message_groups,
+                report.compressed_observations,
+                retrieval.backend,
+            ),
+            AgentEvent::ContextUsageObserved {
+                estimated_prompt_tokens,
+                usage,
+                estimation_delta,
+                overflow_retry,
+                ..
+            } => eprintln!(
+                "[context] estimate={} actual={} delta={} retry={}",
+                estimated_prompt_tokens,
+                usage
+                    .as_ref()
+                    .and_then(|usage| usage.prompt_tokens)
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                estimation_delta.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                overflow_retry,
+            ),
             AgentEvent::TaskCompleted { answer, .. } => {
                 if self.streamed.swap(false, Ordering::Relaxed) {
                     println!();
@@ -372,14 +437,25 @@ impl AgentEventSink for CliEvents {
 
 #[tokio::main]
 async fn main() -> Result<(), CliError> {
-    let cli = Cli::parse();
-    let config = AppConfig::load(cli.config.as_deref(), cli.workspace)?;
+    let Cli {
+        config: config_path,
+        workspace,
+        context_profile,
+        command,
+    } = Cli::parse();
+    let config = AppConfig::load(config_path.as_deref(), workspace)?;
+    let selected_context = config.resolved_context_profile(context_profile);
     let _log_guard = init_logging(&config)?;
-    match cli.command.unwrap_or(Commands::Chat) {
+    match command.unwrap_or(Commands::Chat) {
         Commands::Config {
             command: ConfigCommand::Check,
         } => {
-            println!("configuration is valid");
+            println!(
+                "configuration is valid; context_profile={} context_limit={} output_reserve={}",
+                selected_context.name.as_str(),
+                selected_context.budget.context_limit,
+                selected_context.budget.output_reserve
+            );
             Ok(())
         }
         Commands::Tools {
@@ -402,13 +478,16 @@ async fn main() -> Result<(), CliError> {
             println!("available={} {}", health.available, health.detail);
             Ok(())
         }
-        Commands::Run { task } => run_task(&config, task).await,
-        Commands::Chat => chat(&config).await,
+        Commands::Run { task } => run_task(&config, &selected_context, task).await,
+        Commands::Chat => chat(&config, &selected_context).await,
     }
 }
 
-async fn chat(config: &AppConfig) -> Result<(), CliError> {
-    println!("Veyra v0.2 — enter a task, or /quit to exit.");
+async fn chat(config: &AppConfig, context: &ContextProfile) -> Result<(), CliError> {
+    println!(
+        "Veyra v0.3 — context profile {}; enter a task, or /quit to exit.",
+        context.name.as_str()
+    );
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -422,7 +501,7 @@ async fn chat(config: &AppConfig) -> Result<(), CliError> {
         if matches!(task, "/quit" | "/exit") {
             break;
         }
-        if let Err(error) = run_task(config, task.to_owned()).await {
+        if let Err(error) = run_task(config, context, task.to_owned()).await {
             eprintln!("{error}");
         }
     }
@@ -453,7 +532,11 @@ fn decode_console_input(bytes: &[u8]) -> io::Result<String> {
         })
 }
 
-async fn run_task(config: &AppConfig, task: String) -> Result<(), CliError> {
+async fn run_task(
+    config: &AppConfig,
+    context: &ContextProfile,
+    task: String,
+) -> Result<(), CliError> {
     tokio::fs::create_dir_all(&config.security.workspace_root).await?;
     let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
     let provider = Arc::new(provider(config)?);
@@ -496,6 +579,7 @@ async fn run_task(config: &AppConfig, task: String) -> Result<(), CliError> {
             top_k: config.model.sampling.top_k,
             repeat_penalty: config.model.sampling.repeat_penalty,
         },
+        context_profile: context.clone(),
         system_prompt: include_str!("../../../prompts/system.md").to_owned(),
         cancellation,
     });
@@ -577,6 +661,30 @@ mod tests {
         let mut config = AppConfig::default();
         config.agent.max_iterations = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn context_profile_precedence_and_legacy_compatibility() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            config.resolved_context_profile(None).name,
+            agent_context::ContextProfileName::Default
+        );
+        config.model.context_size = 16_384;
+        assert_eq!(
+            config.resolved_context_profile(None).name,
+            agent_context::ContextProfileName::Legacy
+        );
+        config.context = Some(ContextSection {
+            profile: ContextProfileArg::Default,
+        });
+        assert_eq!(
+            config
+                .resolved_context_profile(Some(ContextProfileArg::Large))
+                .budget
+                .context_limit,
+            65_536
+        );
     }
 
     #[test]

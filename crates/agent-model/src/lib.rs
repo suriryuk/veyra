@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -210,6 +210,30 @@ pub enum ModelError {
     MalformedToolArguments { tool: String, detail: String },
 }
 
+impl ModelError {
+    #[must_use]
+    pub fn is_context_overflow(&self) -> bool {
+        let Self::Http { status, body } = self else {
+            return false;
+        };
+        if !matches!(*status, 400 | 413) {
+            return false;
+        }
+        let body = body.to_ascii_lowercase();
+        [
+            "context length",
+            "context window",
+            "context size",
+            "too many tokens",
+            "maximum context",
+            "prompt is too long",
+            "exceeds the available context",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+    }
+}
+
 #[async_trait]
 pub trait ModelEventSink: Send + Sync {
     async fn token(&self, text: &str);
@@ -278,12 +302,18 @@ struct ChatRequest<'a> {
     messages: &'a [Message],
     tools: &'a [ToolDefinition],
     stream: bool,
+    stream_options: StreamOptions,
     temperature: f32,
     top_p: f32,
     top_k: u32,
     repeat_penalty: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,6 +362,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
             messages: &request.messages,
             tools: &request.tools,
             stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
             temperature: request.sampling.temperature,
             top_p: request.sampling.top_p,
             top_k: request.sampling.top_k,
@@ -507,6 +540,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_context_limit_http_errors_are_overflows() {
+        assert!(
+            ModelError::Http {
+                status: 400,
+                body: "maximum context length exceeded".to_owned(),
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            !ModelError::Http {
+                status: 500,
+                body: "maximum context length exceeded".to_owned(),
+            }
+            .is_context_overflow()
+        );
+        assert!(
+            !ModelError::Http {
+                status: 400,
+                body: "invalid tool schema".to_owned(),
+            }
+            .is_context_overflow()
+        );
+    }
+
     #[tokio::test]
     async fn mock_openai_server_streams_content_and_tool_arguments()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -515,11 +573,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await?;
             let mut request = vec![0_u8; 8192];
-            let _ = socket.read(&mut request).await?;
+            let read = socket.read(&mut request).await?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("\"stream_options\":{\"include_usage\":true}"));
             let events = concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.rs\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n",
                 "data: [DONE]\n\n"
             );
             let response = format!(
@@ -550,6 +611,13 @@ mod tests {
         server.await??;
         assert_eq!(*tokens.0.lock().await, "hello ");
         assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens),
+            Some(12)
+        );
         assert_eq!(response.tool_calls[0].arguments["path"], "a.rs");
         assert_eq!(response.finish_reason, FinishReason::ToolCalls);
         Ok(())

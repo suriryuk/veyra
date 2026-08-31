@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-context = { path = "../agent-context" }
 agent-model = { path = "../agent-model" }
 agent-security = { path = "../agent-security" }
 agent-tools = { path = "../agent-tools" }

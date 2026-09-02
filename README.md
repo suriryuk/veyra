@@ -1,4 +1,4 @@
-# Veyra v0.4
+# Veyra v0.5
 
 Veyra is a safe local coding-agent runtime written in Rust. It connects to an
 OpenAI-compatible `llama-server`, streams model output, inspects a configured
@@ -7,6 +7,8 @@ and reviews the final Git diff before completing a changed task. A bounded Conte
 Manager retrieves relevant source ranges and durable workspace memories while
 keeping every model request within an explicit 32K or 65K profile. SQLite-backed
 sessions preserve task, plan, message, Tool, approval, event, and audit history.
+Veyra v0.5 adds source-traceable web research through SearXNG and a bounded,
+SSRF-resistant static-page fetcher with HTML main-content extraction.
 
 ## Requirements
 
@@ -78,6 +80,14 @@ profile = "default"
 [storage]
 database_path = "data/veyra.sqlite3"
 
+[research]
+searxng_base_url = "http://127.0.0.1:8888/"
+request_timeout_seconds = 20
+max_redirects = 5
+max_response_bytes = 2097152
+max_results = 10
+user_agent = "Veyra/0.5"
+
 [tools]
 command_timeout_seconds = 120
 stdout_limit_bytes = 1048576
@@ -97,7 +107,7 @@ Each profile can set `timeout_seconds`, `stdout_limit_bytes`, and
 `stderr_limit_bytes`. A Tool request may lower but never raise its configured
 timeout. Existing v0.1 configuration files remain valid. Supported environment
 overrides are `VEYRA_MODEL_BASE_URL`, `VEYRA_MODEL_NAME`,
-`VEYRA_WORKSPACE_ROOT`, and `VEYRA_LOG_LEVEL`.
+`VEYRA_WORKSPACE_ROOT`, `VEYRA_LOG_LEVEL`, and `VEYRA_SEARXNG_BASE_URL`.
 
 The built-in `default` profile uses a 32,768-token context with a 2,048-token
 output reserve. `large` uses 65,536 and reserves 4,096. If an older config has no
@@ -112,6 +122,7 @@ veyra run "inspect this project and fix the failing test"
 veyra --context-profile large run "analyze the repository architecture"
 veyra sessions list
 veyra sessions show <session-id> --json --all
+veyra sessions show <session-id> --research
 veyra sessions resume <session-id>
 veyra sessions prune --older-than 90
 veyra models status
@@ -126,6 +137,42 @@ supports UTF-8 and Windows-949/CP949 Korean text. Model tokens stream immediatel
 while workflow, Tool, failure-classification, context selection, estimated usage,
 actual server usage, and overflow-retry events are shown on stderr. The global
 `--context-profile` option overrides `[context].profile` for one invocation.
+
+## v0.5 web research
+
+The repository includes a local-only SearXNG and Valkey Compose stack under
+[`searXNG/`](searXNG/README.md). From that directory, run `./setup.ps1` once and
+then use `docker compose up -d` and `docker compose down` to start and stop it.
+The bundled settings enable the JSON response format and bind SearXNG to
+`127.0.0.1:8888` by default. Its tested image versions are pinned in `.env`;
+updates are explicit and the Compose healthchecks cover both services.
+
+For another SearXNG instance, enable JSON in its `search.formats` setting, then
+set `research.searxng_base_url` or `VEYRA_SEARXNG_BASE_URL`. SearXNG is not
+contacted at startup; an unavailable instance becomes a structured `web_search`
+Tool error only when research is requested.
+
+The Agent uses `web_search` to collect candidate URLs and `http_fetch` to verify
+static sources. Research completion requires at least one fetched final URL in the
+answer. Search snippets and page bodies are explicitly marked as untrusted external
+data, are retained in session Tool results, and cannot grant permission or direct
+Tool execution. Audit records keep bounded query/source metadata but do not duplicate
+the extracted page body. Tasks that explicitly request web search or combine a
+search/research action with source, citation, URL, or freshness requirements cannot
+complete until `web_search` succeeds; prior session memories are omitted from those
+requests and cannot substitute for current evidence. After the same normalized query
+has already led to a successful fetch in the current task, an identical search is
+skipped with guidance to use the verified evidence or refine the query. `sessions show
+<id> --research` prints a bounded research timeline without page bodies or snippets;
+add `--json` for compact machine-readable output.
+
+`http_fetch` accepts only HTTP/HTTPS GET requests and supports `text/html`,
+`application/xhtml+xml`, and `text/plain`. It disables proxies and automatic
+redirects, validates and pins DNS results on every redirect, rejects local/private,
+link-local, reserved, and metadata-service addresses, follows at most five redirects,
+and enforces the configured timeout and byte limit while streaming. JavaScript
+rendering, cookies/login, forms, uploads, downloads, and crawling are not supported.
+Operators remain responsible for each site's terms and robots policy.
 
 ## v0.4 sessions, memory, and audit
 
@@ -229,6 +276,7 @@ Read-only tools run automatically:
 
 - Workspace: `list_directory`, `read_file`, `read_file_range`, `glob`, `grep`
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, and branch listing
+- Web: `web_search` and static GET-only `http_fetch`
 
 State-changing and process tools require an exact one-time approval:
 
@@ -277,24 +325,32 @@ redacted from arguments and summaries.
 
 - `agent-core`: bounded loop, workflow evaluator, failure fingerprints, events
 - `agent-context`: token budgets, retrieval, trimming, observation compression
+- `agent-research`: SearXNG search, SSRF-resistant fetch, source DTOs, extraction
 - `agent-storage`: SQLite migrations, session snapshots, memory and audit queries
 - `agent-model`: provider contract and OpenAI-compatible SSE adapter
 - `agent-tools`: workspace, Git, Cargo, command, output, and process-tree adapters
 - `agent-security`: workspace guard, risk/approval, redaction, JSONL audit
 - `agent-cli`: configuration, composition root, rendering, approval prompt
 
-Web/TUI, MCP/browser automation, document/vision support,
+Web/TUI, MCP/browser automation, dynamic-page rendering, document/vision support,
 remote Git operations, `Allow Always`, embeddings, vector databases, semantic
 reranking, and long-term memory retrieval remain out of scope.
 
 ## Verification status
 
-Veyra v0.4.0 has 46 automated tests covering all prior contracts plus SQLite migration
-and reopen behavior, transactional snapshots, deterministic memory retrieval and
-budgeting, secret-redacted session history, and one-shot interrupted approval/Tool
-normalization. The workspace build, format, strict Clippy, and test gates pass under
-WSL2 Ubuntu 24.04 with Rust 1.85.0. The latest live Qwen3-Coder/llama-server smoke test
-remains the v0.3 baseline; no server was available during this v0.4 verification.
+Veyra v0.5.0 has 74 automated tests covering all prior contracts plus SearXNG JSON search,
+URL deduplication, HTML/text extraction, SSRF address policy, DNS-pinned redirect
+handling, response limits, cancellation, research completion/citation gates, and
+session/audit source persistence, duplicate-query suppression, concise research session
+views, explicit research-intent enforcement, stream/diagnostic separation, and
+search-limit rendering. The workspace build, format, strict Clippy, and test
+gates pass under WSL2 Ubuntu 24.04 with Rust 1.85.0. A live local SearXNG and
+Qwen3-Coder/llama-server smoke test also completed a search, fetched two public static
+sources, cited their final URLs, and preserved bounded source metadata. A direct
+`http_fetch` of the local SearXNG address was rejected as required by the SSRF policy.
+An additional live acceptance test on 2026-09-03 confirmed that a memory-backed
+answer could not bypass an explicit research request and that context diagnostics no
+longer attach to streamed prose or citation URLs.
 
-See [`docs/releases/v0.4.0.md`](docs/releases/v0.4.0.md) for release details. The
+See [`docs/releases/v0.5.0.md`](docs/releases/v0.5.0.md) for release details. The
 `docs/` directory is intentionally local and Git-ignored.

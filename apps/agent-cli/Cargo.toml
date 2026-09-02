@@ -13,6 +13,7 @@ path = "src/main.rs"
 agent-context = { path = "../../crates/agent-context" }
 agent-core = { path = "../../crates/agent-core" }
 agent-model = { path = "../../crates/agent-model" }
+agent-research = { path = "../../crates/agent-research" }
 agent-security = { path = "../../crates/agent-security" }
 agent-storage = { path = "../../crates/agent-storage" }
 agent-tools = { path = "../../crates/agent-tools" }

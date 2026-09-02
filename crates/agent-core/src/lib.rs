@@ -86,6 +86,8 @@ pub struct PlanStep {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub tool_call_id: ToolCallId,
+    #[serde(default)]
+    pub tool_name: String,
     pub summary: String,
     pub content: Value,
     pub truncated: bool,
@@ -384,7 +386,9 @@ impl AgentRunner {
             .map_err(|error| AgentError::Context(error.to_string()))?;
         let sources = retrieval.snippets;
         let retrieval_report = retrieval.report;
-        let memories = if let Some(repository) = &self.sessions {
+        let memories = if task_requires_web_research(&state.task) {
+            Vec::new()
+        } else if let Some(repository) = &self.sessions {
             repository
                 .relevant_memories(&state.workspace, &state.task, 8)
                 .await
@@ -521,7 +525,7 @@ impl AgentRunner {
                 let answer = response
                     .content
                     .unwrap_or_else(|| "Task completed without a textual response.".to_owned());
-                if let Some(requirement) = completion_requirement(&state) {
+                if let Some(requirement) = completion_requirement(&state, &answer) {
                     state.messages.push(Message::system(format!(
                         "Workflow evaluator rejected completion: {requirement}. Continue with the required verification or review before answering."
                     )));
@@ -635,6 +639,7 @@ impl AgentRunner {
                 None,
                 None,
                 None,
+                None,
                 false,
             )
             .await?;
@@ -648,6 +653,7 @@ impl AgentRunner {
                 None,
                 None,
                 Some(error.clone()),
+                None,
                 false,
             )
             .await?;
@@ -664,6 +670,7 @@ impl AgentRunner {
                 .await;
             return Ok(error_observation(
                 call_id,
+                &call.name,
                 error,
                 state.workflow_phase,
                 Some(failure),
@@ -696,6 +703,7 @@ impl AgentRunner {
             None,
             None,
             None,
+            None,
             false,
         )
         .await?;
@@ -712,6 +720,7 @@ impl AgentRunner {
                 None,
                 None,
                 Some(error.clone()),
+                None,
                 false,
             )
             .await?;
@@ -726,6 +735,7 @@ impl AgentRunner {
             let failure = self.register_failure(state, kind, &error).await;
             return Ok(error_observation(
                 call_id,
+                &call.name,
                 error,
                 state.workflow_phase,
                 Some(failure),
@@ -770,6 +780,7 @@ impl AgentRunner {
             Some(decision.clone()),
             None,
             None,
+            None,
             false,
         )
         .await?;
@@ -784,11 +795,13 @@ impl AgentRunner {
                 Some(decision),
                 None,
                 Some("user denied execution".to_owned()),
+                None,
                 false,
             )
             .await?;
             return Ok(Observation {
                 tool_call_id: call_id,
+                tool_name: call.name.clone(),
                 summary: "tool execution denied by user".to_owned(),
                 content: json!({"denied":true}),
                 truncated: false,
@@ -806,6 +819,7 @@ impl AgentRunner {
                 .await;
             return Ok(error_observation(
                 call_id,
+                &call.name,
                 error,
                 state.workflow_phase,
                 Some(failure),
@@ -817,6 +831,7 @@ impl AgentRunner {
             let failure = self.register_failure(state, kind, &error).await;
             return Ok(error_observation(
                 call_id,
+                &call.name,
                 error,
                 state.workflow_phase,
                 Some(failure),
@@ -835,6 +850,7 @@ impl AgentRunner {
             Some(decision.clone()),
             None,
             None,
+            None,
             false,
         )
         .await?;
@@ -847,7 +863,12 @@ impl AgentRunner {
             cancellation: self.cancellation.clone(),
             limits: self.execution_limits.clone(),
         };
-        match tool.execute(&context, call.arguments.clone()).await {
+        let execution = if let Some(result) = duplicate_web_search_result(state, &call) {
+            Ok(result)
+        } else {
+            tool.execute(&context, call.arguments.clone()).await
+        };
+        match execution {
             Ok(result) => {
                 let duration = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 self.audit(
@@ -860,6 +881,7 @@ impl AgentRunner {
                     Some(decision),
                     Some(duration),
                     Some(result.summary.clone()),
+                    Some(result.metadata.clone()),
                     result.truncated,
                 )
                 .await?;
@@ -887,6 +909,7 @@ impl AgentRunner {
                     Some(decision),
                     Some(duration),
                     Some(error.to_string()),
+                    None,
                     false,
                 )
                 .await?;
@@ -903,6 +926,7 @@ impl AgentRunner {
                 let failure = self.register_failure(state, kind, &error).await;
                 Ok(error_observation(
                     call_id,
+                    &call.name,
                     error,
                     state.workflow_phase,
                     Some(failure),
@@ -955,6 +979,7 @@ impl AgentRunner {
 
         Observation {
             tool_call_id: call_id,
+            tool_name: name.to_owned(),
             summary: result.summary,
             content: result.content,
             truncated: result.truncated,
@@ -1007,6 +1032,7 @@ impl AgentRunner {
         approval: Option<ApprovalDecision>,
         duration_ms: Option<u64>,
         summary: Option<String>,
+        metadata: Option<Value>,
         truncated: bool,
     ) -> Result<(), AgentError> {
         let error = matches!(phase, AuditPhase::Failed | AuditPhase::Denied)
@@ -1025,6 +1051,7 @@ impl AgentRunner {
                 approval,
                 duration_ms,
                 summary,
+                metadata,
                 truncated,
                 error,
             })
@@ -1106,7 +1133,37 @@ impl AgentRunner {
     }
 }
 
-fn completion_requirement(state: &AgentState) -> Option<&'static str> {
+fn completion_requirement(state: &AgentState, answer: &str) -> Option<&'static str> {
+    let searched = state
+        .observations
+        .iter()
+        .any(|observation| observation.tool_name == "web_search" && !observation.is_error);
+    let fetch_attempted = state
+        .observations
+        .iter()
+        .any(|observation| observation.tool_name == "http_fetch");
+    let fetched_urls = state.observations.iter().filter_map(|observation| {
+        if observation.tool_name == "http_fetch" && !observation.is_error {
+            observation.content["source"]["final_url"].as_str()
+        } else {
+            None
+        }
+    });
+    let mut fetched = false;
+    let mut cited = false;
+    for url in fetched_urls {
+        fetched = true;
+        cited |= answer.contains(url);
+    }
+    if task_requires_web_research(&state.task) && !searched {
+        return Some("the user explicitly requested web research, but no web_search succeeded");
+    }
+    if searched && !fetch_attempted {
+        return Some("web search results must be verified with http_fetch before answering");
+    }
+    if fetched && !cited {
+        return Some("the final answer must cite at least one successfully fetched final URL");
+    }
     if state.change_sequence == 0 {
         return None;
     }
@@ -1117,6 +1174,142 @@ fn completion_requirement(state: &AgentState) -> Option<&'static str> {
         return Some("a post-change git_diff review is missing");
     }
     None
+}
+
+fn task_requires_web_research(task: &str) -> bool {
+    let task = task.to_lowercase();
+    let words = task
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let direct_research = [
+        "웹에서 검색",
+        "웹에서 조사",
+        "인터넷에서 검색",
+        "인터넷에서 조사",
+        "온라인에서 검색",
+        "온라인에서 조사",
+        "search the web",
+        "browse the web",
+        "look up online",
+        "research online",
+        "search online",
+    ]
+    .iter()
+    .any(|marker| task.contains(marker));
+    let korean_code_change = ["구현", "수정", "리팩터", "코드", "파일", "저장소"]
+        .iter()
+        .any(|marker| task.contains(marker));
+    let english_code_change = [
+        "implement",
+        "implementation",
+        "fix",
+        "refactor",
+        "code",
+        "file",
+        "files",
+        "repository",
+    ]
+    .iter()
+    .any(|marker| words.contains(marker));
+    let code_change = korean_code_change || english_code_change;
+    if direct_research {
+        return true;
+    }
+    if code_change {
+        return false;
+    }
+    let research_action = ["검색", "조사", "search", "research", "look up"]
+        .iter()
+        .any(|marker| task.contains(marker));
+    let evidence_request = [
+        "원문", "출처", "링크", "url", "source", "citation", "cite", "link",
+    ]
+    .iter()
+    .any(|marker| task.contains(marker));
+    let freshness_request = ["최신", "현재", "오늘", "latest", "current", "today"]
+        .iter()
+        .any(|marker| task.contains(marker));
+    research_action && (evidence_request || freshness_request)
+}
+
+fn duplicate_web_search_result(state: &AgentState, call: &RequestedToolCall) -> Option<ToolResult> {
+    if call.name != "web_search" {
+        return None;
+    }
+    let query = call.arguments["query"].as_str()?.trim();
+    let normalized = normalize_search_query(query);
+    if normalized.is_empty() {
+        return None;
+    }
+    let (prior_search_index, prior_search) =
+        state
+            .observations
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, observation)| {
+                observation.tool_name == "web_search"
+                    && !observation.is_error
+                    && observation.content["skipped_duplicate"] != true
+                    && observation.content["query"]
+                        .as_str()
+                        .is_some_and(|value| normalize_search_query(value) == normalized)
+            })?;
+    let source_urls = prior_search.content["sources"]
+        .as_array()?
+        .iter()
+        .filter_map(|source| source["url"].as_str())
+        .collect::<Vec<_>>();
+    let verified_after_search =
+        state
+            .observations
+            .iter()
+            .skip(prior_search_index + 1)
+            .any(|observation| {
+                if observation.tool_name != "http_fetch" || observation.is_error {
+                    return false;
+                }
+                let source = &observation.content["source"];
+                [
+                    source["requested_url"].as_str(),
+                    source["final_url"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|url| source_urls.contains(&url))
+            });
+    if !verified_after_search {
+        return None;
+    }
+    Some(ToolResult {
+        content: json!({
+            "kind":"web_search",
+            "query":query,
+            "sources":[],
+            "skipped_duplicate":true,
+            "notice":"An identical search already produced results followed by a successful source fetch in this task. Use the existing fetched evidence and answer, or refine the query when different evidence is required."
+        }),
+        summary: "duplicate web search skipped; use fetched evidence or refine the query"
+            .to_owned(),
+        truncated: false,
+        metadata: json!({
+            "kind":"web_search",
+            "query":query,
+            "provider":"searxng",
+            "result_count":0,
+            "skipped_duplicate":true,
+            "reason":"identical query already followed by a successful fetch"
+        }),
+    })
+}
+
+fn normalize_search_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn is_verification_action(name: &str, arguments: &Value) -> bool {
@@ -1192,12 +1385,14 @@ fn failure_kind_from_metadata(metadata: &Value) -> FailureKind {
 
 fn error_observation(
     call_id: ToolCallId,
+    tool_name: &str,
     error: String,
     workflow_phase: WorkflowPhase,
     failure: Option<FailureInfo>,
 ) -> Observation {
     Observation {
         tool_call_id: call_id,
+        tool_name: tool_name.to_owned(),
         summary: error.clone(),
         content: json!({"error":error}),
         truncated: false,
@@ -1476,6 +1671,173 @@ mod tests {
         let state = runner.run("task").await?;
         assert_eq!(state.status, AgentStatus::Completed);
         assert_eq!(state.plan[0].status, StepStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_research_requires_fetch_and_a_fetched_url_citation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let tool_call = |name: &str, arguments: Value| ModelResponse {
+            content: None,
+            tool_calls: vec![RequestedToolCall {
+                id: format!("call-{name}"),
+                name: name.to_owned(),
+                arguments,
+            }],
+            usage: None,
+            finish_reason: FinishReason::ToolCalls,
+        };
+        let answer = |content: &str| ModelResponse {
+            content: Some(content.to_owned()),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: FinishReason::Stop,
+        };
+        let provider = FakeModel {
+            responses: Mutex::new(vec![
+                answer("Summary: source https://example.com/final"),
+                answer("Summary without a citation"),
+                tool_call("web_search", json!({"query":"  rust  "})),
+                tool_call("http_fetch", json!({"url":"https://example.com/final"})),
+                answer("Premature search-only answer"),
+                tool_call("web_search", json!({"query":"Rust"})),
+                answer("Unverified memory answer https://example.com/final"),
+            ]),
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(WorkflowTool {
+            name: "web_search",
+            risk: RiskLevel::Read,
+            results: Mutex::new(vec![ToolResult {
+                content: json!({"kind":"web_search","query":"Rust","sources":[{"url":"https://example.com/final"}]}),
+                summary: "search complete".to_owned(),
+                truncated: false,
+                metadata: json!({"kind":"web_search","query":"Rust"}),
+            }]),
+        })?;
+        registry.register(WorkflowTool {
+            name: "http_fetch",
+            risk: RiskLevel::Read,
+            results: Mutex::new(vec![ToolResult {
+                content: json!({"kind":"http_fetch","source":{"final_url":"https://example.com/final"},"text":"evidence"}),
+                summary: "fetch complete".to_owned(),
+                truncated: false,
+                metadata: json!({"kind":"http_fetch"}),
+            }]),
+        })?;
+        let runner = AgentRunner::new(AgentRunnerConfig {
+            provider: Arc::new(provider),
+            registry: Arc::new(registry),
+            approver: Arc::new(Allow),
+            audit: Arc::new(Null),
+            events: Arc::new(Null),
+            workspace: WorkspaceGuard::new(temp.path())?,
+            limits: AgentLimits::default(),
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+            sessions: None,
+        });
+        let state = runner.run("search Rust and cite source URLs").await?;
+        assert_eq!(state.status, AgentStatus::Completed);
+        assert_eq!(state.observations.len(), 3);
+        assert_eq!(state.observations[0].tool_name, "web_search");
+        assert_eq!(state.observations[1].tool_name, "http_fetch");
+        assert_eq!(state.observations[2].tool_name, "web_search");
+        assert_eq!(state.observations[2].content["skipped_duplicate"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_search_requires_a_fetch_of_one_of_its_results() {
+        let observation = |name: &str, content: Value| Observation {
+            tool_call_id: ToolCallId::new(),
+            tool_name: name.to_owned(),
+            summary: name.to_owned(),
+            content,
+            truncated: false,
+            is_error: false,
+            workflow_phase: WorkflowPhase::Discovery,
+            failure: None,
+        };
+        let mut state = AgentState {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            workspace: ".".to_owned(),
+            task: "research Rust".to_owned(),
+            status: AgentStatus::Thinking,
+            plan: Vec::new(),
+            messages: Vec::new(),
+            observations: vec![
+                observation(
+                    "web_search",
+                    json!({"query":"Rust","sources":[{"url":"https://example.com/rust"}]}),
+                ),
+                observation(
+                    "http_fetch",
+                    json!({"source":{"final_url":"https://example.com/unrelated"}}),
+                ),
+            ],
+            iteration: 1,
+            tool_calls: 2,
+            consecutive_errors: 0,
+            workflow_phase: WorkflowPhase::Discovery,
+            change_sequence: 0,
+            last_successful_verification: None,
+            last_diff_review: None,
+            failure_counts: BTreeMap::new(),
+        };
+        let call = RequestedToolCall {
+            id: "duplicate".to_owned(),
+            name: "web_search".to_owned(),
+            arguments: json!({"query":" rust "}),
+        };
+        assert!(duplicate_web_search_result(&state, &call).is_none());
+        state.observations[1].content = json!({"source":{"requested_url":"https://example.com/rust","final_url":"https://example.com/final"}});
+        assert!(duplicate_web_search_result(&state, &call).is_some());
+    }
+
+    #[test]
+    fn web_research_intent_avoids_repository_search_false_positives() {
+        assert!(task_requires_web_research(
+            "Rust 1.85를 검색하고 원문을 확인한 뒤 URL과 함께 요약해줘"
+        ));
+        assert!(task_requires_web_research(
+            "search the web for the latest Rust release"
+        ));
+        assert!(!task_requires_web_research(
+            "저장소에서 URL 문자열을 검색하고 코드를 수정해줘"
+        ));
+        assert!(!task_requires_web_research(
+            "search this repository and fix the parser code"
+        ));
+        assert!(!task_requires_web_research(
+            "implement the online status indicator"
+        ));
+        assert!(!task_requires_web_research(
+            "웹에서 동작하는 URL parser를 구현해줘"
+        ));
+        assert!(task_requires_web_research(
+            "research the latest profile sources"
+        ));
+    }
+
+    #[test]
+    fn v04_observation_without_tool_name_is_compatible() -> Result<(), Box<dyn std::error::Error>> {
+        let value = json!({
+            "tool_call_id":ToolCallId::new(),
+            "summary":"old observation",
+            "content":{},
+            "truncated":false,
+            "is_error":false,
+            "workflow_phase":"discovery",
+            "failure":null
+        });
+        let observation: Observation = serde_json::from_value(value)?;
+        assert!(observation.tool_name.is_empty());
         Ok(())
     }
 

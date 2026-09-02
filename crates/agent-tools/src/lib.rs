@@ -2,6 +2,7 @@ mod builtins;
 mod cargo_tools;
 mod git_tools;
 mod process;
+mod web_tools;
 
 use agent_model::ToolDefinition;
 use agent_security::{RiskLevel, SessionId, TaskId, ToolCallId, WorkspaceGuard};
@@ -14,6 +15,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 pub use builtins::register_builtin_tools;
+pub use web_tools::register_research_tools;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

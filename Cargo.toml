@@ -5,13 +5,14 @@ members = [
     "crates/agent-context",
     "crates/agent-core",
     "crates/agent-model",
+    "crates/agent-research",
     "crates/agent-security",
     "crates/agent-storage",
     "crates/agent-tools",
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -30,6 +31,7 @@ hex = "0.4"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+scraper = "0.22"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

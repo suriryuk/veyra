@@ -161,6 +161,14 @@ impl SqliteSessionRepository {
             .map_err(|error| error.to_string())?
     }
 
+    pub async fn show_research(&self, id: &str, limit: Option<usize>) -> Result<Value, String> {
+        let path = self.path.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || research_view(&path, &id, limit))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     pub async fn load_latest(&self, id: &str) -> Result<AgentState, String> {
         let path = self.path.clone();
         let id = id.to_owned();
@@ -264,6 +272,9 @@ impl SessionRepository for SqliteSessionRepository {
 impl AuditSink for SqliteSessionRepository {
     async fn record(&self, mut event: AuditEvent) -> Result<(), SecurityError> {
         redact_value(&mut event.arguments);
+        if let Some(metadata) = &mut event.metadata {
+            redact_value(metadata);
+        }
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let connection = connect(&path)?;
@@ -491,6 +502,7 @@ fn load_and_normalize(path: &Path, id: &str) -> Result<AgentState, String> {
         );
         let observation = Observation {
             tool_call_id: call_id,
+            tool_name: String::new(),
             summary: summary.clone(),
             content: json!({"interrupted":true,"previous_status":previous}),
             truncated: false,
@@ -579,6 +591,117 @@ fn show(path: &Path, id: &str, limit: Option<usize>) -> Result<Value, String> {
         "audit":audit,
         "memories":memories
     }))
+}
+
+fn research_view(path: &Path, id: &str, limit: Option<usize>) -> Result<Value, String> {
+    let connection = connect(path)?;
+    let session = connection
+        .query_row(
+            "SELECT id,status,updated_at FROM sessions WHERE id=?1",
+            [id],
+            |row| {
+                Ok(json!({
+                    "id":row.get::<_,String>(0)?,
+                    "status":row.get::<_,String>(1)?,
+                    "updated_at":row.get::<_,String>(2)?
+                }))
+            },
+        )
+        .optional()
+        .map_err(display)?
+        .ok_or_else(|| format!("session not found: {id}"))?;
+    let row_limit = limit
+        .and_then(|value| i64::try_from(value).ok())
+        .unwrap_or(i64::MAX);
+    let mut entries = research_rows(&connection, id, row_limit)?;
+    entries.reverse();
+    Ok(json!({"session":session,"research":entries}))
+}
+
+fn research_rows(connection: &Connection, id: &str, limit: i64) -> Result<Vec<Value>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT tc.call_id,tc.tool_name,tc.arguments_json,tc.status,tc.result_json,tc.error,tc.updated_at
+             FROM tool_calls tc JOIN tasks t ON t.id=tc.task_id
+             WHERE t.session_id=?1 AND tc.tool_name IN ('web_search','http_fetch')
+             ORDER BY tc.updated_at DESC LIMIT ?2",
+        )
+        .map_err(display)?;
+    let rows = statement
+        .query_map(params![id, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(display)?;
+    rows.map(|row| {
+        let (call_id, tool_name, arguments, status, result, error, updated_at) =
+            row.map_err(display)?;
+        let arguments = parse_json(&arguments)?;
+        let result = parse_optional_json(result.as_deref())?;
+        if tool_name == "web_search" {
+            let sources = result["content"]["sources"]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|source| {
+                            json!({
+                                "rank":source["rank"],
+                                "title":source["title"],
+                                "url":source["url"],
+                                "provider":source["provider"],
+                                "engine":source["engine"],
+                                "searched_at":source["searched_at"]
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(json!({
+                "call_id":call_id,
+                "kind":"web_search",
+                "status":status,
+                "updated_at":updated_at,
+                "query":arguments["query"],
+                "requested_limit":arguments["limit"],
+                "provider":result["metadata"]["provider"],
+                "result_count":result["metadata"]["result_count"],
+                "limit_reached":result["metadata"]["limit_reached"],
+                "searched_at":result["metadata"]["searched_at"],
+                "skipped_duplicate":result["metadata"]["skipped_duplicate"],
+                "sources":sources,
+                "error":error
+            }))
+        } else {
+            let source = if result["metadata"]["source"].is_object() {
+                &result["metadata"]["source"]
+            } else {
+                &result["content"]["source"]
+            };
+            Ok(json!({
+                "call_id":call_id,
+                "kind":"http_fetch",
+                "status":status,
+                "updated_at":updated_at,
+                "requested_url":arguments["url"],
+                "final_url":source["final_url"],
+                "title":source["title"],
+                "fetched_at":source["fetched_at"],
+                "content_type":source["content_type"],
+                "redirects":source["redirects"],
+                "received_bytes":result["metadata"]["received_bytes"],
+                "error":error
+            }))
+        }
+    })
+    .collect()
 }
 
 fn tool_call_rows(connection: &Connection, id: &str, limit: i64) -> Result<Vec<Value>, String> {
@@ -731,7 +854,8 @@ mod tests {
     use super::*;
     use agent_core::WorkflowPhase;
     use agent_core::{PlanStep, StepStatus};
-    use agent_security::{ApprovalRequest, RiskLevel, SessionId, TaskId};
+    use agent_security::{ApprovalRequest, AuditPhase, RiskLevel, SessionId, TaskId};
+    use agent_tools::ToolResult;
     use std::collections::BTreeMap;
 
     fn state(workspace: &Path) -> AgentState {
@@ -803,6 +927,139 @@ mod tests {
         assert_eq!(repository.prune_count(30).await?, 1);
         assert_eq!(repository.prune(30).await?, 1);
         assert!(repository.list_sessions(10).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn research_source_metadata_is_queryable_without_audit_body_duplication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = SqliteSessionRepository::open(temp.path().join("sessions.db")).await?;
+        let value = state(temp.path());
+        let search_call_id = ToolCallId::new();
+        let search_arguments = json!({"query":"Rust 1.85","limit":2});
+        repository
+            .checkpoint(
+                &value,
+                Some(&AgentEvent::ToolRequested {
+                    call_id: search_call_id,
+                    model_call_id: "search-call".to_owned(),
+                    name: "web_search".to_owned(),
+                    arguments: search_arguments,
+                    risk: RiskLevel::Read,
+                }),
+            )
+            .await?;
+        repository
+            .checkpoint(
+                &value,
+                Some(&AgentEvent::ToolCompleted {
+                    call_id: search_call_id,
+                    result: ToolResult {
+                        content: json!({
+                            "kind":"web_search",
+                            "query":"Rust 1.85",
+                            "sources":[{
+                                "rank":1,
+                                "title":"Rust 1.85",
+                                "url":"https://example.com/article",
+                                "provider":"searxng",
+                                "engine":"example",
+                                "searched_at":"2026-09-02T00:00:00Z",
+                                "snippet":"OMITTED-FROM-RESEARCH-VIEW"
+                            }]
+                        }),
+                        summary: "web search returned 1 source".to_owned(),
+                        truncated: false,
+                        metadata: json!({
+                            "kind":"web_search",
+                            "query":"Rust 1.85",
+                            "provider":"searxng",
+                            "result_count":1,
+                            "limit_reached":false,
+                            "searched_at":"2026-09-02T00:00:00Z"
+                        }),
+                    },
+                }),
+            )
+            .await?;
+        let call_id = ToolCallId::new();
+        let arguments = json!({"url":"https://example.com/article"});
+        repository
+            .checkpoint(
+                &value,
+                Some(&AgentEvent::ToolRequested {
+                    call_id,
+                    model_call_id: "fetch-call".to_owned(),
+                    name: "http_fetch".to_owned(),
+                    arguments: arguments.clone(),
+                    risk: RiskLevel::Read,
+                }),
+            )
+            .await?;
+        let source = json!({
+            "requested_url":"https://example.com/article",
+            "final_url":"https://example.com/final",
+            "fetched_at":"2026-09-02T00:00:00Z",
+            "content_type":"text/html"
+        });
+        repository
+            .checkpoint(
+                &value,
+                Some(&AgentEvent::ToolCompleted {
+                    call_id,
+                    result: ToolResult {
+                        content: json!({"kind":"http_fetch","source":source,"text":"BODY-MUST-NOT-BE-IN-AUDIT"}),
+                        summary: "fetched https://example.com/final".to_owned(),
+                        truncated: false,
+                        metadata: json!({"kind":"http_fetch","source":source}),
+                    },
+                }),
+            )
+            .await?;
+        repository
+            .record(AuditEvent {
+                timestamp: Utc::now(),
+                session_id: value.session_id,
+                task_id: value.task_id,
+                call_id,
+                tool_name: "http_fetch".to_owned(),
+                arguments,
+                risk: RiskLevel::Read,
+                phase: AuditPhase::Completed,
+                approval: Some(ApprovalDecision::NotRequired),
+                duration_ms: Some(1),
+                summary: Some("fetched https://example.com/final".to_owned()),
+                metadata: Some(json!({"kind":"http_fetch","source":source})),
+                truncated: false,
+                error: None,
+            })
+            .await?;
+        let shown = repository
+            .show_session(&value.session_id.to_string(), None)
+            .await?;
+        assert_eq!(
+            shown["tool_calls"][0]["result"]["content"]["source"]["final_url"],
+            "https://example.com/final"
+        );
+        assert!(
+            shown["audit"]
+                .to_string()
+                .contains("https://example.com/final")
+        );
+        assert!(
+            !shown["audit"]
+                .to_string()
+                .contains("BODY-MUST-NOT-BE-IN-AUDIT")
+        );
+        let research = repository
+            .show_research(&value.session_id.to_string(), None)
+            .await?;
+        assert_eq!(research["research"].as_array().map(Vec::len), Some(2));
+        assert!(research.to_string().contains("Rust 1.85"));
+        assert!(research.to_string().contains("https://example.com/final"));
+        assert!(!research.to_string().contains("BODY-MUST-NOT-BE-IN-AUDIT"));
+        assert!(!research.to_string().contains("OMITTED-FROM-RESEARCH-VIEW"));
         Ok(())
     }
 

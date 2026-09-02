@@ -4,6 +4,7 @@ use agent_core::{
 };
 use agent_model::Message;
 use agent_model::{ModelProvider, OpenAiCompatibleProvider, SamplingConfig};
+use agent_research::{FetchPolicy, HttpFetcher, SearxngProvider};
 use agent_security::{
     ApprovalDecision, ApprovalProvider, ApprovalRequest, CompositeAuditSink, JsonlAuditSink,
     SessionId, WorkspaceGuard,
@@ -11,6 +12,7 @@ use agent_security::{
 use agent_storage::SqliteSessionRepository;
 use agent_tools::{
     CommandLimits, CommandProfiles, ExecutionLimits, ToolRegistry, register_builtin_tools,
+    register_research_tools,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -90,6 +92,8 @@ enum SessionCommand {
         all: bool,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        research: bool,
     },
     Resume {
         id: String,
@@ -133,6 +137,7 @@ struct AppConfig {
     agent: AgentSection,
     model: ModelSection,
     context: Option<ContextSection>,
+    research: ResearchSection,
     security: SecuritySection,
     tools: ToolsSection,
     logging: LoggingSection,
@@ -142,6 +147,16 @@ struct AppConfig {
 #[serde(default)]
 struct ContextSection {
     profile: ContextProfileArg,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ResearchSection {
+    searxng_base_url: String,
+    request_timeout_seconds: u64,
+    max_redirects: usize,
+    max_response_bytes: usize,
+    max_results: usize,
+    user_agent: String,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -224,6 +239,18 @@ impl Default for ContextSection {
     fn default() -> Self {
         Self {
             profile: ContextProfileArg::Default,
+        }
+    }
+}
+impl Default for ResearchSection {
+    fn default() -> Self {
+        Self {
+            searxng_base_url: "http://127.0.0.1:8888/".to_owned(),
+            request_timeout_seconds: 20,
+            max_redirects: 5,
+            max_response_bytes: 2_097_152,
+            max_results: 10,
+            user_agent: "Veyra/0.5".to_owned(),
         }
     }
 }
@@ -312,6 +339,9 @@ impl AppConfig {
         if let Ok(value) = env::var("VEYRA_LOG_LEVEL") {
             config.logging.level = value;
         }
+        if let Ok(value) = env::var("VEYRA_SEARXNG_BASE_URL") {
+            config.research.searxng_base_url = value;
+        }
         if let Some(value) = workspace_override {
             config.security.workspace_root = value;
         }
@@ -330,6 +360,22 @@ impl AppConfig {
         if self.model.request_timeout_seconds == 0 || self.tools.command_timeout_seconds == 0 {
             return Err(CliError::Config("timeouts must be positive".to_owned()));
         }
+        if self.research.request_timeout_seconds == 0
+            || self.research.max_redirects == 0
+            || self.research.max_response_bytes == 0
+            || self.research.max_results == 0
+            || self.research.user_agent.trim().is_empty()
+        {
+            return Err(CliError::Config(
+                "research limits and user agent must be non-empty and positive".to_owned(),
+            ));
+        }
+        SearxngProvider::new(
+            &self.research.searxng_base_url,
+            Duration::from_secs(self.research.request_timeout_seconds),
+            &self.research.user_agent,
+        )
+        .map_err(|error| CliError::Config(error.to_string()))?;
         for profile in [
             &self.tools.command_profiles.default,
             &self.tools.command_profiles.cargo_build,
@@ -442,21 +488,49 @@ impl ApprovalProvider for CliApprover {
 }
 
 struct CliEvents {
-    streamed: AtomicBool,
+    streamed_current_response: AtomicBool,
+    stream_boundary_pending: AtomicBool,
 }
 impl CliEvents {
     fn new() -> Self {
         Self {
-            streamed: AtomicBool::new(false),
+            streamed_current_response: AtomicBool::new(false),
+            stream_boundary_pending: AtomicBool::new(false),
+        }
+    }
+
+    fn record_token(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.streamed_current_response
+            .store(true, Ordering::Relaxed);
+        self.stream_boundary_pending.store(true, Ordering::Relaxed);
+    }
+
+    fn close_stream_line(&self) -> bool {
+        if self.stream_boundary_pending.swap(false, Ordering::Relaxed) {
+            println!();
+            let _ = io::stdout().flush();
+            true
+        } else {
+            false
         }
     }
 }
 #[async_trait]
 impl AgentEventSink for CliEvents {
     async fn emit(&self, event: AgentEvent) {
+        if !matches!(&event, AgentEvent::TokenDelta { .. }) {
+            self.close_stream_line();
+        }
+        if matches!(&event, AgentEvent::ContextBuilt { .. }) {
+            self.streamed_current_response
+                .store(false, Ordering::Relaxed);
+        }
         match event {
             AgentEvent::TokenDelta { text, .. } => {
-                self.streamed.store(true, Ordering::Relaxed);
+                self.record_token(&text);
                 print!("{text}");
                 let _ = io::stdout().flush();
             }
@@ -464,7 +538,7 @@ impl AgentEventSink for CliEvents {
             AgentEvent::ToolCompleted { result, .. } => eprintln!(
                 "[tool] {}{}",
                 result.summary,
-                if result.truncated { " (truncated)" } else { "" }
+                tool_result_qualifier(&result)
             ),
             AgentEvent::ToolFailed { error, .. } => eprintln!("[tool] failed: {error}"),
             AgentEvent::WorkflowPhaseChanged { phase, .. } => eprintln!("[workflow] {phase:?}"),
@@ -481,7 +555,7 @@ impl AgentEventSink for CliEvents {
             AgentEvent::ContextBuilt {
                 report, retrieval, ..
             } => eprintln!(
-                "[context] profile={} prompt~{}/{} output={} sources={}/{} memories={}/{} messages={} compressed={} retrieval={}",
+                "[context] profile={} prompt~{}/{} output={} workspace_sources={}/{} memories={}/{} messages={} compressed={} retrieval={}",
                 report.profile.as_str(),
                 report.usage.prompt_tokens,
                 report.usage.input_limit,
@@ -511,15 +585,30 @@ impl AgentEventSink for CliEvents {
                 overflow_retry,
             ),
             AgentEvent::TaskCompleted { answer, .. } => {
-                if self.streamed.swap(false, Ordering::Relaxed) {
-                    println!();
-                } else {
+                if !self
+                    .streamed_current_response
+                    .swap(false, Ordering::Relaxed)
+                {
                     println!("{answer}");
                 }
             }
-            AgentEvent::TaskFailed { error, .. } => eprintln!("task failed: {error}"),
+            AgentEvent::TaskFailed { error, .. } => {
+                self.streamed_current_response
+                    .store(false, Ordering::Relaxed);
+                eprintln!("task failed: {error}");
+            }
             _ => {}
         }
+    }
+}
+
+fn tool_result_qualifier(result: &agent_tools::ToolResult) -> &'static str {
+    if !result.truncated {
+        ""
+    } else if result.metadata["kind"] == "web_search" && result.metadata["limit_reached"] == true {
+        " (configured limit reached)"
+    } else {
+        " (truncated)"
     }
 }
 
@@ -551,7 +640,7 @@ async fn main() -> Result<(), CliError> {
         Commands::Tools {
             command: ToolCommand::List,
         } => {
-            let registry = registry()?;
+            let registry = registry(&config)?;
             for definition in registry.definitions() {
                 println!(
                     "{}\t{}",
@@ -596,7 +685,7 @@ async fn chat_session(
     mut history: Vec<Message>,
 ) -> Result<(), CliError> {
     println!(
-        "Veyra v0.4 — session {}; context profile {}; enter a task, or /quit to exit.",
+        "Veyra v0.5 — session {}; context profile {}; enter a task, or /quit to exit.",
         session_id,
         context.name.as_str(),
     );
@@ -688,7 +777,7 @@ async fn runner(
     let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
     let provider = Arc::new(provider(config)?);
     provider.health().await?;
-    let registry = Arc::new(registry()?);
+    let registry = Arc::new(registry(config)?);
     let jsonl = Arc::new(JsonlAuditSink::open(config.logging.directory.join("audit.jsonl")).await?);
     let audit_sinks: Vec<Arc<dyn agent_security::AuditSink>> = vec![database.clone(), jsonl];
     let audit = Arc::new(CompositeAuditSink::new(audit_sinks));
@@ -772,22 +861,27 @@ async fn sessions(
             limit,
             all,
             json: json_output,
+            research,
         } => {
             let limit = if all {
                 None
             } else {
                 Some(limit.unwrap_or(100))
             };
-            let value = database
-                .show_session(&id, limit)
-                .await
-                .map_err(CliError::Storage)?;
+            let value = if research {
+                database.show_research(&id, limit).await
+            } else {
+                database.show_session(&id, limit).await
+            }
+            .map_err(CliError::Storage)?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::to_string(&value)
                         .map_err(|error| CliError::Storage(error.to_string()))?
                 );
+            } else if research {
+                print_research_summary(&value);
             } else {
                 println!(
                     "{}",
@@ -857,6 +951,57 @@ async fn sessions(
     Ok(())
 }
 
+fn print_research_summary(value: &serde_json::Value) {
+    println!(
+        "session={} status={} updated_at={}",
+        value["session"]["id"].as_str().unwrap_or("-"),
+        value["session"]["status"].as_str().unwrap_or("-"),
+        value["session"]["updated_at"].as_str().unwrap_or("-")
+    );
+    let Some(entries) = value["research"].as_array() else {
+        return;
+    };
+    for entry in entries {
+        let updated_at = entry["updated_at"].as_str().unwrap_or("-");
+        let status = entry["status"].as_str().unwrap_or("-");
+        if entry["kind"] == "web_search" {
+            let query = entry["query"].as_str().unwrap_or("-");
+            if entry["skipped_duplicate"] == true {
+                println!("[search] {updated_at} status={status} skipped_duplicate query={query:?}");
+            } else {
+                let count = entry["result_count"].as_u64().unwrap_or(0);
+                let provider = entry["provider"].as_str().unwrap_or("-");
+                println!(
+                    "[search] {updated_at} status={status} provider={provider} results={count} query={query:?}"
+                );
+                if let Some(sources) = entry["sources"].as_array() {
+                    for source in sources {
+                        println!(
+                            "  {}. {} — {}",
+                            source["rank"].as_u64().unwrap_or(0),
+                            source["title"].as_str().unwrap_or("(untitled)"),
+                            source["url"].as_str().unwrap_or("-")
+                        );
+                    }
+                }
+            }
+        } else {
+            println!(
+                "[fetch] {updated_at} status={status} requested={} final={} fetched_at={} content_type={} bytes={}{}",
+                entry["requested_url"].as_str().unwrap_or("-"),
+                entry["final_url"].as_str().unwrap_or("-"),
+                entry["fetched_at"].as_str().unwrap_or("-"),
+                entry["content_type"].as_str().unwrap_or("-"),
+                entry["received_bytes"].as_u64().unwrap_or(0),
+                entry["error"]
+                    .as_str()
+                    .map(|error| format!(" error={error:?}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+}
+
 fn command_profiles(config: &AppConfig) -> CommandProfiles {
     let defaults = CommandProfiles::default();
     let flat = CommandLimits {
@@ -894,9 +1039,26 @@ fn apply_command_overrides(
     limits
 }
 
-fn registry() -> Result<ToolRegistry, agent_tools::ToolError> {
+fn registry(config: &AppConfig) -> Result<ToolRegistry, CliError> {
     let mut value = ToolRegistry::new();
     register_builtin_tools(&mut value)?;
+    let timeout = Duration::from_secs(config.research.request_timeout_seconds);
+    let provider = Arc::new(
+        SearxngProvider::new(
+            &config.research.searxng_base_url,
+            timeout,
+            &config.research.user_agent,
+        )
+        .map_err(|error| CliError::Config(error.to_string()))?,
+    );
+    let fetcher = HttpFetcher::new(FetchPolicy::production(
+        timeout,
+        config.research.max_redirects,
+        config.research.max_response_bytes,
+        config.research.user_agent.clone(),
+    ))
+    .map_err(|error| CliError::Config(error.to_string()))?;
+    register_research_tools(&mut value, provider, fetcher, config.research.max_results)?;
     Ok(value)
 }
 
@@ -926,11 +1088,86 @@ fn init_logging(config: &AppConfig) -> Result<WorkerGuard, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn research_session_view_flag_parses() -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from([
+            "veyra",
+            "sessions",
+            "show",
+            "session-id",
+            "--research",
+            "--json",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sessions {
+                command: SessionCommand::Show {
+                    research: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn web_search_limit_has_a_specific_cli_qualifier() {
+        let result = agent_tools::ToolResult {
+            content: serde_json::Value::Null,
+            summary: "search".to_owned(),
+            truncated: true,
+            metadata: serde_json::json!({"kind":"web_search","limit_reached":true}),
+        };
+        assert_eq!(
+            tool_result_qualifier(&result),
+            " (configured limit reached)"
+        );
+    }
+
+    #[test]
+    fn streaming_state_closes_an_open_line_without_losing_response_state() {
+        let events = CliEvents::new();
+        events.record_token("partial answer");
+        assert!(events.stream_boundary_pending.load(Ordering::Relaxed));
+        assert!(events.streamed_current_response.load(Ordering::Relaxed));
+        assert!(events.close_stream_line());
+        assert!(!events.stream_boundary_pending.load(Ordering::Relaxed));
+        assert!(events.streamed_current_response.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn invalid_limits_are_rejected() {
         let mut config = AppConfig::default();
         config.agent.max_iterations = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_research_configuration_is_rejected() {
+        let mut config = AppConfig::default();
+        config.research.max_results = 0;
+        assert!(config.validate().is_err());
+        config = AppConfig::default();
+        config.research.searxng_base_url = "file:///tmp/search".to_owned();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn registry_includes_research_tools() -> Result<(), CliError> {
+        let definitions = registry(&AppConfig::default())?.definitions();
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.function.name == "web_search")
+        );
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.function.name == "http_fetch")
+        );
+        Ok(())
     }
 
     #[test]

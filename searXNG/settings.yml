@@ -1,0 +1,18 @@
+use_default_settings: true
+
+general:
+  instance_name: "Veyra SearXNG"
+  debug: false
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  limiter: false
+  image_proxy: false
+
+valkey:
+  url: valkey://valkey:6379/0

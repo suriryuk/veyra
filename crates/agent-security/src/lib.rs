@@ -258,6 +258,8 @@ pub struct AuditEvent {
     pub approval: Option<ApprovalDecision>,
     pub duration_ms: Option<u64>,
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     pub truncated: bool,
     pub error: Option<String>,
 }
@@ -314,6 +316,9 @@ impl JsonlAuditSink {
 impl AuditSink for JsonlAuditSink {
     async fn record(&self, mut event: AuditEvent) -> Result<(), SecurityError> {
         redact_value(&mut event.arguments);
+        if let Some(metadata) = &mut event.metadata {
+            redact_value(metadata);
+        }
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
         let mut file = self.file.lock().await;
@@ -354,6 +359,15 @@ pub fn redact_value(value: &mut Value) {
             *text = "[REDACTED]".to_owned();
         }
         _ => {}
+    }
+}
+
+#[must_use]
+pub fn network_risk(method: &str, upload: bool) -> RiskLevel {
+    if !upload && matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD") {
+        RiskLevel::Read
+    } else {
+        RiskLevel::Dangerous
     }
 }
 
@@ -451,6 +465,14 @@ mod tests {
         assert_eq!(value["usage"]["total_tokens"], 15);
     }
 
+    #[test]
+    fn network_mutations_and_uploads_are_dangerous() {
+        assert_eq!(network_risk("GET", false), RiskLevel::Read);
+        assert_eq!(network_risk("HEAD", false), RiskLevel::Read);
+        assert_eq!(network_risk("POST", false), RiskLevel::Dangerous);
+        assert_eq!(network_risk("GET", true), RiskLevel::Dangerous);
+    }
+
     #[tokio::test]
     async fn jsonl_audit_serializes_and_redacts() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -468,6 +490,7 @@ mod tests {
             approval: None,
             duration_ms: None,
             summary: None,
+            metadata: Some(serde_json::json!({"api_token":"metadata-secret"})),
             truncated: false,
             error: None,
         })
@@ -475,6 +498,7 @@ mod tests {
         let line = tokio::fs::read_to_string(path).await?;
         let value: Value = serde_json::from_str(line.trim())?;
         assert_eq!(value["arguments"]["api_key"], "[REDACTED]");
+        assert_eq!(value["metadata"]["api_token"], "[REDACTED]");
         assert_eq!(value["phase"], "requested");
         Ok(())
     }

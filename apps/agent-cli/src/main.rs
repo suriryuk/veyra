@@ -1,9 +1,14 @@
 use agent_context::ContextProfile;
-use agent_core::{AgentEvent, AgentEventSink, AgentLimits, AgentRunner, AgentRunnerConfig};
+use agent_core::{
+    AgentError, AgentEvent, AgentEventSink, AgentLimits, AgentRunner, AgentRunnerConfig, AgentState,
+};
+use agent_model::Message;
 use agent_model::{ModelProvider, OpenAiCompatibleProvider, SamplingConfig};
 use agent_security::{
-    ApprovalDecision, ApprovalProvider, ApprovalRequest, JsonlAuditSink, WorkspaceGuard,
+    ApprovalDecision, ApprovalProvider, ApprovalRequest, CompositeAuditSink, JsonlAuditSink,
+    SessionId, WorkspaceGuard,
 };
+use agent_storage::SqliteSessionRepository;
 use agent_tools::{
     CommandLimits, CommandProfiles, ExecutionLimits, ToolRegistry, register_builtin_tools,
 };
@@ -53,6 +58,10 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    Sessions {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -66,6 +75,31 @@ enum ToolCommand {
 #[derive(Subcommand)]
 enum ConfigCommand {
     Check,
+}
+#[derive(Subcommand)]
+enum SessionCommand {
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Resume {
+        id: String,
+    },
+    Prune {
+        #[arg(long)]
+        older_than: i64,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, ValueEnum, PartialEq, Eq)]
@@ -89,6 +123,8 @@ enum CliError {
     Model(#[from] agent_model::ModelError),
     #[error("agent failed: {0}")]
     Agent(#[from] agent_core::AgentError),
+    #[error("storage failed: {0}")]
+    Storage(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -100,6 +136,7 @@ struct AppConfig {
     security: SecuritySection,
     tools: ToolsSection,
     logging: LoggingSection,
+    storage: StorageSection,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -167,6 +204,11 @@ struct LoggingSection {
     level: String,
     directory: PathBuf,
 }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct StorageSection {
+    database_path: PathBuf,
+}
 
 impl Default for AgentSection {
     fn default() -> Self {
@@ -230,6 +272,13 @@ impl Default for LoggingSection {
         Self {
             level: "info".to_owned(),
             directory: PathBuf::from("logs"),
+        }
+    }
+}
+impl Default for StorageSection {
+    fn default() -> Self {
+        Self {
+            database_path: PathBuf::from("data/veyra.sqlite3"),
         }
     }
 }
@@ -304,6 +353,11 @@ impl AppConfig {
         if self.security.workspace_root.as_os_str().is_empty() {
             return Err(CliError::Config("workspace root is empty".to_owned()));
         }
+        if self.storage.database_path.as_os_str().is_empty() {
+            return Err(CliError::Config(
+                "storage database path is empty".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -320,7 +374,27 @@ impl AppConfig {
     }
 }
 
-struct CliApprover;
+struct CliApprover {
+    cancellation: CancellationToken,
+}
+
+enum ApprovalInput {
+    Line(String),
+    Cancelled,
+}
+
+async fn wait_for_approval_input(
+    cancellation: &CancellationToken,
+    receiver: tokio::sync::oneshot::Receiver<io::Result<Option<String>>>,
+) -> ApprovalInput {
+    tokio::select! {
+        () = cancellation.cancelled() => ApprovalInput::Cancelled,
+        result = receiver => ApprovalInput::Line(
+            result.ok().and_then(Result::ok).flatten().unwrap_or_default()
+        ),
+    }
+}
+
 #[async_trait]
 impl ApprovalProvider for CliApprover {
     async fn decide(&self, request: &ApprovalRequest) -> ApprovalDecision {
@@ -340,7 +414,19 @@ impl ApprovalProvider for CliApprover {
         }
         eprint!("Allow once? [y/N] ");
         let _ = io::stderr().flush();
-        let input = read_console_line().ok().flatten().unwrap_or_default();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_console_line());
+        });
+        let input = match wait_for_approval_input(&self.cancellation, receiver).await {
+            ApprovalInput::Line(input) => input,
+            ApprovalInput::Cancelled => {
+                eprintln!("\napproval cancelled");
+                return ApprovalDecision::Cancelled {
+                    decided_at: Utc::now(),
+                };
+            }
+        };
         let allowed = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
         if allowed {
             ApprovalDecision::AllowedOnce {
@@ -395,13 +481,15 @@ impl AgentEventSink for CliEvents {
             AgentEvent::ContextBuilt {
                 report, retrieval, ..
             } => eprintln!(
-                "[context] profile={} prompt~{}/{} output={} sources={}/{} messages={} compressed={} retrieval={}",
+                "[context] profile={} prompt~{}/{} output={} sources={}/{} memories={}/{} messages={} compressed={} retrieval={}",
                 report.profile.as_str(),
                 report.usage.prompt_tokens,
                 report.usage.input_limit,
                 report.usage.output_reserve,
                 report.selected_sources,
                 report.selected_sources + report.dropped_sources,
+                report.selected_memories,
+                report.selected_memories + report.dropped_memories,
                 report.selected_message_groups,
                 report.compressed_observations,
                 retrieval.backend,
@@ -450,11 +538,13 @@ async fn main() -> Result<(), CliError> {
         Commands::Config {
             command: ConfigCommand::Check,
         } => {
+            let database = storage(&config).await?;
             println!(
-                "configuration is valid; context_profile={} context_limit={} output_reserve={}",
+                "configuration is valid; context_profile={} context_limit={} output_reserve={} database={}",
                 selected_context.name.as_str(),
                 selected_context.budget.context_limit,
-                selected_context.budget.output_reserve
+                selected_context.budget.output_reserve,
+                database.path().display()
             );
             Ok(())
         }
@@ -478,15 +568,37 @@ async fn main() -> Result<(), CliError> {
             println!("available={} {}", health.available, health.detail);
             Ok(())
         }
-        Commands::Run { task } => run_task(&config, &selected_context, task).await,
+        Commands::Run { task } => {
+            let state = run_task(
+                &config,
+                &selected_context,
+                SessionId::new(),
+                Vec::new(),
+                task,
+            )
+            .await?;
+            println!("session_id={}", state.session_id);
+            Ok(())
+        }
         Commands::Chat => chat(&config, &selected_context).await,
+        Commands::Sessions { command } => sessions(&config, &selected_context, command).await,
     }
 }
 
 async fn chat(config: &AppConfig, context: &ContextProfile) -> Result<(), CliError> {
+    chat_session(config, context, SessionId::new(), Vec::new()).await
+}
+
+async fn chat_session(
+    config: &AppConfig,
+    context: &ContextProfile,
+    session_id: SessionId,
+    mut history: Vec<Message>,
+) -> Result<(), CliError> {
     println!(
-        "Veyra v0.3 — context profile {}; enter a task, or /quit to exit.",
-        context.name.as_str()
+        "Veyra v0.4 — session {}; context profile {}; enter a task, or /quit to exit.",
+        session_id,
+        context.name.as_str(),
     );
     loop {
         print!("> ");
@@ -501,8 +613,28 @@ async fn chat(config: &AppConfig, context: &ContextProfile) -> Result<(), CliErr
         if matches!(task, "/quit" | "/exit") {
             break;
         }
-        if let Err(error) = run_task(config, context, task.to_owned()).await {
-            eprintln!("{error}");
+        match run_task(
+            config,
+            context,
+            session_id,
+            history.clone(),
+            task.to_owned(),
+        )
+        .await
+        {
+            Ok(state) => history = state.messages,
+            Err(CliError::Agent(AgentError::Cancelled)) => {
+                eprintln!("task cancelled");
+                break;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                if let Ok(database) = storage(config).await {
+                    if let Ok(state) = database.load_latest(&session_id.to_string()).await {
+                        history = state.messages;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -535,14 +667,31 @@ fn decode_console_input(bytes: &[u8]) -> io::Result<String> {
 async fn run_task(
     config: &AppConfig,
     context: &ContextProfile,
+    session_id: SessionId,
+    history: Vec<Message>,
     task: String,
-) -> Result<(), CliError> {
+) -> Result<AgentState, CliError> {
+    let database = Arc::new(storage(config).await?);
+    let runner = runner(config, context, database).await?;
+    runner
+        .run_in_session(session_id, history, task)
+        .await
+        .map_err(CliError::from)
+}
+
+async fn runner(
+    config: &AppConfig,
+    context: &ContextProfile,
+    database: Arc<SqliteSessionRepository>,
+) -> Result<AgentRunner, CliError> {
     tokio::fs::create_dir_all(&config.security.workspace_root).await?;
     let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
     let provider = Arc::new(provider(config)?);
     provider.health().await?;
     let registry = Arc::new(registry()?);
-    let audit = Arc::new(JsonlAuditSink::open(config.logging.directory.join("audit.jsonl")).await?);
+    let jsonl = Arc::new(JsonlAuditSink::open(config.logging.directory.join("audit.jsonl")).await?);
+    let audit_sinks: Vec<Arc<dyn agent_security::AuditSink>> = vec![database.clone(), jsonl];
+    let audit = Arc::new(CompositeAuditSink::new(audit_sinks));
     let cancellation = CancellationToken::new();
     let signal = cancellation.clone();
     tokio::spawn(async move {
@@ -555,7 +704,9 @@ async fn run_task(
     let runner = AgentRunner::new(AgentRunnerConfig {
         provider,
         registry,
-        approver: Arc::new(CliApprover),
+        approver: Arc::new(CliApprover {
+            cancellation: cancellation.clone(),
+        }),
         audit,
         events: Arc::new(CliEvents::new()),
         workspace,
@@ -582,8 +733,127 @@ async fn run_task(
         context_profile: context.clone(),
         system_prompt: include_str!("../../../prompts/system.md").to_owned(),
         cancellation,
+        sessions: Some(database),
     });
-    runner.run(task).await?;
+    Ok(runner)
+}
+
+async fn storage(config: &AppConfig) -> Result<SqliteSessionRepository, CliError> {
+    SqliteSessionRepository::open(&config.storage.database_path)
+        .await
+        .map_err(CliError::Storage)
+}
+
+async fn sessions(
+    config: &AppConfig,
+    context: &ContextProfile,
+    command: SessionCommand,
+) -> Result<(), CliError> {
+    let database = Arc::new(storage(config).await?);
+    match command {
+        SessionCommand::List { limit } => {
+            for session in database
+                .list_sessions(limit)
+                .await
+                .map_err(CliError::Storage)?
+            {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    session.id,
+                    session.status,
+                    session.updated_at,
+                    session.workspace,
+                    session.recent_task
+                );
+            }
+        }
+        SessionCommand::Show {
+            id,
+            limit,
+            all,
+            json: json_output,
+        } => {
+            let limit = if all {
+                None
+            } else {
+                Some(limit.unwrap_or(100))
+            };
+            let value = database
+                .show_session(&id, limit)
+                .await
+                .map_err(CliError::Storage)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&value)
+                        .map_err(|error| CliError::Storage(error.to_string()))?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value)
+                        .map_err(|error| CliError::Storage(error.to_string()))?
+                );
+            }
+        }
+        SessionCommand::Resume { id } => {
+            let mut state = database.load_latest(&id).await.map_err(CliError::Storage)?;
+            let canonical = std::fs::canonicalize(&config.security.workspace_root)?;
+            if state.workspace != canonical.display().to_string() {
+                return Err(CliError::Storage(format!(
+                    "session workspace {} does not match configured workspace {}",
+                    state.workspace,
+                    canonical.display()
+                )));
+            }
+            if !matches!(
+                state.status,
+                agent_core::AgentStatus::Completed
+                    | agent_core::AgentStatus::Failed
+                    | agent_core::AgentStatus::Cancelled
+            ) {
+                let value = runner(config, context, database.clone())
+                    .await?
+                    .resume(state)
+                    .await?;
+                state = value;
+            }
+            chat_session(config, context, state.session_id, state.messages).await?;
+        }
+        SessionCommand::Prune { older_than, yes } => {
+            if older_than < 0 {
+                return Err(CliError::Config(
+                    "--older-than must be non-negative".to_owned(),
+                ));
+            }
+            let count = database
+                .prune_count(older_than)
+                .await
+                .map_err(CliError::Storage)?;
+            if count == 0 {
+                println!("no terminal sessions matched");
+                return Ok(());
+            }
+            let confirmed = if yes {
+                true
+            } else {
+                print!("delete {count} terminal sessions from SQLite? [y/N] ");
+                io::stdout().flush()?;
+                read_console_line()?.is_some_and(|answer| {
+                    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+                })
+            };
+            if confirmed {
+                let deleted = database
+                    .prune(older_than)
+                    .await
+                    .map_err(CliError::Storage)?;
+                println!("deleted {deleted} sessions; logs/audit.jsonl remains append-only");
+            } else {
+                println!("prune cancelled");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -702,5 +972,16 @@ mod tests {
         assert!(!had_errors);
         assert_eq!(decode_console_input(&bytes)?, "한국어 입력\n");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_input_observes_cancellation_without_a_line() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            wait_for_approval_input(&cancellation, receiver).await,
+            ApprovalInput::Cancelled
+        ));
     }
 }

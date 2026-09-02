@@ -39,6 +39,7 @@ pub struct TokenBudget {
     pub source: usize,
     pub observation: usize,
     pub conversation: usize,
+    pub memory: usize,
     pub output_reserve: usize,
 }
 
@@ -51,7 +52,8 @@ impl TokenBudget {
             task_plan: 2_048,
             source: 16_384,
             observation: 6_144,
-            conversation: 4_096,
+            conversation: 3_072,
+            memory: 1_024,
             output_reserve: 2_048,
         }
     }
@@ -64,7 +66,8 @@ impl TokenBudget {
             task_plan: 4_096,
             source: 32_768,
             observation: 12_288,
-            conversation: 8_192,
+            conversation: 6_144,
+            memory: 2_048,
             output_reserve: 4_096,
         }
     }
@@ -79,7 +82,8 @@ impl TokenBudget {
             task_plan: input / 16,
             source: input / 2,
             observation: input * 3 / 16,
-            conversation: input * 2 / 16,
+            conversation: input * 3 / 32,
+            memory: input / 32,
             output_reserve,
         }
     }
@@ -159,6 +163,12 @@ pub struct SourceSnippet {
     pub end_line: usize,
     pub content: String,
     pub score: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemorySnippet {
+    pub summary: String,
     pub reason: String,
 }
 
@@ -541,6 +551,7 @@ pub struct ContextInput<'a> {
     pub plan: &'a [String],
     pub history: &'a [Message],
     pub sources: &'a [SourceSnippet],
+    pub memories: &'a [MemorySnippet],
     pub tools: &'a [ToolDefinition],
     pub aggressive: bool,
 }
@@ -565,6 +576,8 @@ pub struct ContextReport {
     pub usage: ContextUsage,
     pub selected_sources: usize,
     pub dropped_sources: usize,
+    pub selected_memories: usize,
+    pub dropped_memories: usize,
     pub selected_message_groups: usize,
     pub dropped_message_groups: usize,
     pub compressed_observations: usize,
@@ -632,6 +645,11 @@ impl ContextManager {
         } else {
             budget.source
         };
+        let memory_cap = if input.aggressive {
+            self.profile.budget.memory / 2
+        } else {
+            self.profile.budget.memory
+        };
         let has_observations = input
             .history
             .iter()
@@ -682,6 +700,22 @@ impl ContextManager {
                 source_tokens += tokens;
                 used += tokens;
                 selected_sources += 1;
+                messages.push(message);
+            }
+        }
+
+        let mut memory_tokens = 0;
+        let mut selected_memories = 0;
+        for memory in input.memories {
+            let message = Message::system(format!(
+                "Relevant durable memory ({}):\n{}",
+                memory.reason, memory.summary
+            ));
+            let tokens = self.estimator.estimate_message(&message);
+            if memory_tokens + tokens <= memory_cap && used + tokens <= input_limit {
+                memory_tokens += tokens;
+                used += tokens;
+                selected_memories += 1;
                 messages.push(message);
             }
         }
@@ -784,6 +818,8 @@ impl ContextManager {
             },
             selected_sources,
             dropped_sources: input.sources.len().saturating_sub(selected_sources),
+            selected_memories,
+            dropped_memories: input.memories.len().saturating_sub(selected_memories),
             selected_message_groups,
             dropped_message_groups: total_groups.saturating_sub(selected_message_groups),
             compressed_observations,
@@ -901,6 +937,7 @@ mod tests {
                     plan: &[],
                     history: &[],
                     sources: &[],
+                    memories: &[],
                     tools: &[tool()],
                     aggressive: false,
                 })?;
@@ -933,6 +970,7 @@ mod tests {
             plan: &[],
             history: &history,
             sources: &[],
+            memories: &[],
             tools: &[tool()],
             aggressive: false,
         })?;
@@ -968,6 +1006,7 @@ mod tests {
             plan: &[],
             history: &history,
             sources: &[],
+            memories: &[],
             tools: &[tool()],
             aggressive: false,
         })?;
@@ -1067,6 +1106,43 @@ mod tests {
                 .iter()
                 .any(|snippet| snippet.path == "README.md")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_is_bounded_and_aggressive_retry_reduces_it() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let memories = (0..20)
+            .map(|index| MemorySnippet {
+                summary: format!("durable session result {index} {}", "detail ".repeat(80)),
+                reason: "task terms matched".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let manager = ContextManager::new(ContextProfile::default_32k());
+        let normal = manager.build(ContextInput {
+            system_prompt: "system",
+            task: "durable session",
+            plan: &[],
+            history: &[],
+            sources: &[],
+            memories: &memories,
+            tools: &[tool()],
+            aggressive: false,
+        })?;
+        let aggressive = manager.build(ContextInput {
+            system_prompt: "system",
+            task: "durable session",
+            plan: &[],
+            history: &[],
+            sources: &[],
+            memories: &memories,
+            tools: &[tool()],
+            aggressive: true,
+        })?;
+        assert!(normal.report.selected_memories > 0);
+        assert!(normal.report.dropped_memories > 0);
+        assert!(aggressive.report.selected_memories <= normal.report.selected_memories);
+        assert!(normal.report.usage.prompt_tokens <= manager.profile().budget.input_limit());
         Ok(())
     }
 }

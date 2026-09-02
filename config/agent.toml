@@ -19,6 +19,9 @@ repeat_penalty = 1.05
 [context]
 profile = "default"
 
+[storage]
+database_path = "data/veyra.sqlite3"
+
 [security]
 workspace_root = "workspace"
 

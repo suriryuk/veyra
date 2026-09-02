@@ -1,5 +1,5 @@
 [package]
-name = "agent-core"
+name = "agent-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,23 +7,19 @@ license.workspace = true
 
 [dependencies]
 agent-context = { path = "../agent-context" }
+agent-core = { path = "../agent-core" }
 agent-model = { path = "../agent-model" }
 agent-security = { path = "../agent-security" }
-agent-tools = { path = "../agent-tools" }
 async-trait.workspace = true
 chrono.workspace = true
-hex.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-tokio-util.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

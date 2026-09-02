@@ -146,6 +146,8 @@ pub enum SecurityError {
     AuditIo(#[from] std::io::Error),
     #[error("audit serialization failed: {0}")]
     AuditSerialization(#[from] serde_json::Error),
+    #[error("audit storage failed: {0}")]
+    AuditStorage(String),
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +268,28 @@ pub trait AuditSink: Send + Sync {
 }
 
 #[derive(Clone)]
+pub struct CompositeAuditSink {
+    sinks: Vec<Arc<dyn AuditSink>>,
+}
+
+impl CompositeAuditSink {
+    #[must_use]
+    pub fn new(sinks: Vec<Arc<dyn AuditSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+#[async_trait]
+impl AuditSink for CompositeAuditSink {
+    async fn record(&self, event: AuditEvent) -> Result<(), SecurityError> {
+        for sink in &self.sinks {
+            sink.record(event.clone()).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct JsonlAuditSink {
     file: Arc<Mutex<File>>,
 }
@@ -335,16 +359,24 @@ pub fn redact_value(value: &mut Value) {
 
 fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    [
-        "authorization",
-        "api_key",
-        "apikey",
-        "token",
-        "password",
-        "secret",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
+    matches!(
+        key.as_str(),
+        "authorization"
+            | "proxy_authorization"
+            | "api_key"
+            | "apikey"
+            | "token"
+            | "password"
+            | "passwd"
+            | "secret"
+    ) || key.ends_with("_api_key")
+        || key.ends_with("-api-key")
+        || key.ends_with("_token")
+        || key.ends_with("-token")
+        || key.ends_with("_password")
+        || key.ends_with("-password")
+        || key.ends_with("_secret")
+        || key.ends_with("-secret")
 }
 
 fn summarize_effect(tool: &str, arguments: &Value) -> String {
@@ -406,10 +438,17 @@ mod tests {
 
     #[test]
     fn redacts_nested_secrets() {
-        let mut value = serde_json::json!({"environment":{"API_TOKEN":"secret"},"x":"Bearer abc"});
+        let mut value = serde_json::json!({
+            "environment":{"API_TOKEN":"secret"},
+            "usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15},
+            "x":"Bearer abc"
+        });
         redact_value(&mut value);
         assert_eq!(value["environment"]["API_TOKEN"], "[REDACTED]");
         assert_eq!(value["x"], "[REDACTED]");
+        assert_eq!(value["usage"]["prompt_tokens"], 12);
+        assert_eq!(value["usage"]["completion_tokens"], 3);
+        assert_eq!(value["usage"]["total_tokens"], 15);
     }
 
     #[tokio::test]

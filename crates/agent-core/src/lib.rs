@@ -1,6 +1,6 @@
 use agent_context::{
-    ContextInput, ContextManager, ContextProfile, ContextReport, RepositoryRetriever,
-    RetrievalReport, WorkspaceRetriever,
+    ContextInput, ContextManager, ContextProfile, ContextReport, MemorySnippet,
+    RepositoryRetriever, RetrievalReport, WorkspaceRetriever,
 };
 use agent_model::{
     Message, ModelEventSink, ModelProvider, ModelRequest, RequestedToolCall, SamplingConfig,
@@ -98,6 +98,7 @@ pub struct Observation {
 pub struct AgentState {
     pub session_id: SessionId,
     pub task_id: TaskId,
+    pub workspace: String,
     pub task: String,
     pub status: AgentStatus,
     pub plan: Vec<PlanStep>,
@@ -111,6 +112,24 @@ pub struct AgentState {
     pub last_successful_verification: Option<usize>,
     pub last_diff_review: Option<usize>,
     pub failure_counts: BTreeMap<String, usize>,
+}
+
+#[async_trait]
+pub trait SessionRepository: Send + Sync {
+    async fn checkpoint(
+        &self,
+        state: &AgentState,
+        event: Option<&AgentEvent>,
+    ) -> Result<(), String>;
+
+    async fn relevant_memories(
+        &self,
+        workspace: &str,
+        task: &str,
+        limit: usize,
+    ) -> Result<Vec<MemorySnippet>, String>;
+
+    async fn store_memory(&self, state: &AgentState, answer: &str) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +189,7 @@ pub enum AgentEvent {
     },
     ToolRequested {
         call_id: ToolCallId,
+        model_call_id: String,
         name: String,
         arguments: Value,
         risk: RiskLevel,
@@ -221,6 +241,8 @@ pub enum AgentError {
     Tool(String),
     #[error("audit failed: {0}")]
     Audit(String),
+    #[error("session persistence failed: {0}")]
+    Persistence(String),
     #[error("agent limit reached: {0}")]
     Limit(String),
     #[error("task was cancelled")]
@@ -240,6 +262,7 @@ pub struct AgentRunner {
     context: ContextManager,
     system_prompt: String,
     cancellation: CancellationToken,
+    sessions: Option<Arc<dyn SessionRepository>>,
 }
 
 pub struct AgentRunnerConfig {
@@ -255,6 +278,7 @@ pub struct AgentRunnerConfig {
     pub context_profile: ContextProfile,
     pub system_prompt: String,
     pub cancellation: CancellationToken,
+    pub sessions: Option<Arc<dyn SessionRepository>>,
 }
 
 impl AgentRunner {
@@ -273,15 +297,31 @@ impl AgentRunner {
             context: ContextManager::new(config.context_profile),
             system_prompt: config.system_prompt,
             cancellation: config.cancellation,
+            sessions: config.sessions,
         }
     }
 
     pub async fn run(&self, task: impl Into<String>) -> Result<AgentState, AgentError> {
+        self.run_in_session(SessionId::new(), Vec::new(), task)
+            .await
+    }
+
+    pub async fn run_in_session(
+        &self,
+        session_id: SessionId,
+        mut history: Vec<Message>,
+        task: impl Into<String>,
+    ) -> Result<AgentState, AgentError> {
         let task = task.into();
         let task_id = TaskId::new();
+        if history.is_empty() {
+            history.push(Message::system(self.system_prompt.clone()));
+        }
+        history.push(Message::user(task.clone()));
         let mut state = AgentState {
-            session_id: SessionId::new(),
+            session_id,
             task_id,
+            workspace: self.workspace.root().display().to_string(),
             task: task.clone(),
             status: AgentStatus::Ready,
             plan: vec![PlanStep {
@@ -289,10 +329,7 @@ impl AgentRunner {
                 description: task.clone(),
                 status: StepStatus::InProgress,
             }],
-            messages: vec![
-                Message::system(self.system_prompt.clone()),
-                Message::user(task),
-            ],
+            messages: history,
             observations: Vec::new(),
             iteration: 0,
             tool_calls: 0,
@@ -303,13 +340,38 @@ impl AgentRunner {
             last_diff_review: None,
             failure_counts: BTreeMap::new(),
         };
-        self.events
-            .emit(AgentEvent::PlanCreated {
+        self.emit(
+            &state,
+            AgentEvent::PlanCreated {
                 task_id,
                 steps: state.plan.clone(),
-            })
-            .await;
+            },
+        )
+        .await?;
         self.set_status(&mut state, AgentStatus::Thinking).await;
+        self.run_state(state).await
+    }
+
+    pub async fn resume(&self, mut state: AgentState) -> Result<AgentState, AgentError> {
+        if state.workspace != self.workspace.root().display().to_string() {
+            return Err(AgentError::Persistence(
+                "stored session workspace does not match the configured workspace".to_owned(),
+            ));
+        }
+        if matches!(
+            state.status,
+            AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Cancelled
+        ) {
+            return Err(AgentError::Persistence(
+                "terminal tasks cannot be resumed; start a new task in the session".to_owned(),
+            ));
+        }
+        self.set_status(&mut state, AgentStatus::Thinking).await;
+        self.run_state(state).await
+    }
+
+    async fn run_state(&self, mut state: AgentState) -> Result<AgentState, AgentError> {
+        let task_id = state.task_id;
 
         let retrieval = WorkspaceRetriever::new(self.workspace.root())
             .retrieve(
@@ -322,6 +384,14 @@ impl AgentRunner {
             .map_err(|error| AgentError::Context(error.to_string()))?;
         let sources = retrieval.snippets;
         let retrieval_report = retrieval.report;
+        let memories = if let Some(repository) = &self.sessions {
+            repository
+                .relevant_memories(&state.workspace, &state.task, 8)
+                .await
+                .map_err(AgentError::Persistence)?
+        } else {
+            Vec::new()
+        };
 
         loop {
             if self.cancellation.is_cancelled() {
@@ -359,17 +429,20 @@ impl AgentRunner {
                         plan: &plan,
                         history: &state.messages,
                         sources: &sources,
+                        memories: &memories,
                         tools: &tools,
                         aggressive: overflow_retry,
                     })
                     .map_err(|error| AgentError::Context(error.to_string()))?;
-                self.events
-                    .emit(AgentEvent::ContextBuilt {
+                self.emit(
+                    &state,
+                    AgentEvent::ContextBuilt {
                         task_id,
                         report: built.report.clone(),
                         retrieval: retrieval_report.clone(),
-                    })
-                    .await;
+                    },
+                )
+                .await?;
                 let report = built.report;
                 let response = self
                     .provider
@@ -410,16 +483,18 @@ impl AgentRunner {
                         i64::try_from(actual).unwrap_or(i64::MAX)
                             - i64::try_from(context_report.usage.prompt_tokens).unwrap_or(i64::MAX)
                     });
-                    self.events
-                        .emit(AgentEvent::ContextUsageObserved {
+                    self.emit(
+                        &state,
+                        AgentEvent::ContextUsageObserved {
                             task_id,
                             profile: context_report.profile,
                             estimated_prompt_tokens: context_report.usage.prompt_tokens,
                             usage: value.usage.clone(),
                             estimation_delta,
                             overflow_retry,
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                     value
                 }
                 Err(error) => {
@@ -441,6 +516,7 @@ impl AgentRunner {
                 response.content.clone(),
                 &response.tool_calls,
             ));
+            self.checkpoint(&state, None).await?;
             if response.tool_calls.is_empty() {
                 let answer = response
                     .content
@@ -457,9 +533,20 @@ impl AgentRunner {
                 self.set_workflow_phase(&mut state, WorkflowPhase::Completed)
                     .await;
                 self.set_status(&mut state, AgentStatus::Completed).await;
-                self.events
-                    .emit(AgentEvent::TaskCompleted { task_id, answer })
-                    .await;
+                self.emit(
+                    &state,
+                    AgentEvent::TaskCompleted {
+                        task_id,
+                        answer: answer.clone(),
+                    },
+                )
+                .await?;
+                if let Some(repository) = &self.sessions {
+                    repository
+                        .store_memory(&state, &answer)
+                        .await
+                        .map_err(AgentError::Persistence)?;
+                }
                 return Ok(state);
             }
             for call in response.tool_calls {
@@ -491,6 +578,7 @@ impl AgentRunner {
                             serde_json::to_string(&value).unwrap_or_else(|_| value.summary.clone());
                         state.messages.push(Message::tool(model_call_id, content));
                         state.observations.push(value);
+                        self.checkpoint(&state, None).await?;
                         if repeated_failure {
                             return self
                                 .fail(
@@ -526,14 +614,17 @@ impl AgentRunner {
         let call_id = ToolCallId::new();
         let Some(tool) = self.registry.get(&call.name) else {
             let error = format!("unknown tool: {}", call.name);
-            self.events
-                .emit(AgentEvent::ToolRequested {
+            self.emit(
+                state,
+                AgentEvent::ToolRequested {
                     call_id,
+                    model_call_id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     risk: RiskLevel::Dangerous,
-                })
-                .await;
+                },
+            )
+            .await?;
             self.audit(
                 state,
                 call_id,
@@ -560,12 +651,14 @@ impl AgentRunner {
                 false,
             )
             .await?;
-            self.events
-                .emit(AgentEvent::ToolFailed {
+            self.emit(
+                state,
+                AgentEvent::ToolFailed {
                     call_id,
                     error: error.clone(),
-                })
-                .await;
+                },
+            )
+            .await?;
             let failure = self
                 .register_failure(state, FailureKind::Tool, &error)
                 .await;
@@ -582,14 +675,17 @@ impl AgentRunner {
             .as_ref()
             .copied()
             .unwrap_or(RiskLevel::Dangerous);
-        self.events
-            .emit(AgentEvent::ToolRequested {
+        self.emit(
+            state,
+            AgentEvent::ToolRequested {
                 call_id,
+                model_call_id: call.id.clone(),
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
                 risk,
-            })
-            .await;
+            },
+        )
+        .await?;
         self.audit(
             state,
             call_id,
@@ -619,12 +715,14 @@ impl AgentRunner {
                 false,
             )
             .await?;
-            self.events
-                .emit(AgentEvent::ToolFailed {
+            self.emit(
+                state,
+                AgentEvent::ToolFailed {
                     call_id,
                     error: error.clone(),
-                })
-                .await;
+                },
+            )
+            .await?;
             let failure = self.register_failure(state, kind, &error).await;
             return Ok(error_observation(
                 call_id,
@@ -642,18 +740,22 @@ impl AgentRunner {
         );
         let decision = if risk.requires_approval() {
             self.set_status(state, AgentStatus::AwaitingApproval).await;
-            self.events
-                .emit(AgentEvent::ApprovalRequested {
+            self.emit(
+                state,
+                AgentEvent::ApprovalRequested {
                     request: request.clone(),
-                })
-                .await;
+                },
+            )
+            .await?;
             let decision = self.approver.decide(&request).await;
-            self.events
-                .emit(AgentEvent::ApprovalResolved {
+            self.emit(
+                state,
+                AgentEvent::ApprovalResolved {
                     approval_id: request.approval_id,
                     decision: decision.clone(),
-                })
-                .await;
+                },
+            )
+            .await?;
             decision
         } else {
             ApprovalDecision::NotRequired
@@ -721,7 +823,8 @@ impl AgentRunner {
             ));
         }
         self.set_status(state, AgentStatus::ExecutingTool).await;
-        self.events.emit(AgentEvent::ToolStarted { call_id }).await;
+        self.emit(state, AgentEvent::ToolStarted { call_id })
+            .await?;
         self.audit(
             state,
             call_id,
@@ -760,12 +863,14 @@ impl AgentRunner {
                     result.truncated,
                 )
                 .await?;
-                self.events
-                    .emit(AgentEvent::ToolCompleted {
+                self.emit(
+                    state,
+                    AgentEvent::ToolCompleted {
                         call_id,
                         result: result.clone(),
-                    })
-                    .await;
+                    },
+                )
+                .await?;
                 Ok(self
                     .observation_from_result(state, call_id, &call.name, &call.arguments, result)
                     .await)
@@ -785,12 +890,14 @@ impl AgentRunner {
                     false,
                 )
                 .await?;
-                self.events
-                    .emit(AgentEvent::ToolFailed {
+                self.emit(
+                    state,
+                    AgentEvent::ToolFailed {
                         call_id,
                         error: error.to_string(),
-                    })
-                    .await;
+                    },
+                )
+                .await?;
                 let kind = failure_kind_for_tool_error(&error);
                 let error = error.to_string();
                 let failure = self.register_failure(state, kind, &error).await;
@@ -925,14 +1032,35 @@ impl AgentRunner {
             .map_err(|e| AgentError::Audit(e.to_string()))
     }
 
+    async fn checkpoint(
+        &self,
+        state: &AgentState,
+        event: Option<&AgentEvent>,
+    ) -> Result<(), AgentError> {
+        if let Some(repository) = &self.sessions {
+            repository
+                .checkpoint(state, event)
+                .await
+                .map_err(AgentError::Persistence)?;
+        }
+        Ok(())
+    }
+
+    async fn emit(&self, state: &AgentState, event: AgentEvent) -> Result<(), AgentError> {
+        self.checkpoint(state, Some(&event)).await?;
+        self.events.emit(event).await;
+        Ok(())
+    }
+
     async fn set_status(&self, state: &mut AgentState, status: AgentStatus) {
         state.status = status;
-        self.events
-            .emit(AgentEvent::StatusChanged {
-                task_id: state.task_id,
-                status,
-            })
-            .await;
+        let event = AgentEvent::StatusChanged {
+            task_id: state.task_id,
+            status,
+        };
+        if let Err(error) = self.emit(state, event).await {
+            tracing::error!(error = %error, "failed to persist status transition");
+        }
     }
 
     async fn set_workflow_phase(&self, state: &mut AgentState, phase: WorkflowPhase) {
@@ -940,12 +1068,13 @@ impl AgentRunner {
             return;
         }
         state.workflow_phase = phase;
-        self.events
-            .emit(AgentEvent::WorkflowPhaseChanged {
-                task_id: state.task_id,
-                phase,
-            })
-            .await;
+        let event = AgentEvent::WorkflowPhaseChanged {
+            task_id: state.task_id,
+            phase,
+        };
+        if let Err(error) = self.emit(state, event).await {
+            tracing::error!(error = %error, "failed to persist workflow transition");
+        }
     }
 
     async fn fail(
@@ -965,12 +1094,14 @@ impl AgentRunner {
             },
         )
         .await;
-        self.events
-            .emit(AgentEvent::TaskFailed {
+        self.emit(
+            state,
+            AgentEvent::TaskFailed {
                 task_id: state.task_id,
                 error: error.to_string(),
-            })
-            .await;
+            },
+        )
+        .await?;
         Err(error)
     }
 }
@@ -1276,6 +1407,7 @@ mod tests {
             context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
+            sessions: None,
         }))
     }
 
@@ -1339,6 +1471,7 @@ mod tests {
             context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
+            sessions: None,
         });
         let state = runner.run("task").await?;
         assert_eq!(state.status, AgentStatus::Completed);
@@ -1385,6 +1518,7 @@ mod tests {
             context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
+            sessions: None,
         });
         let state = runner.run("task").await?;
         assert!(!executed.load(Ordering::SeqCst));
@@ -1472,6 +1606,7 @@ mod tests {
             context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
+            sessions: None,
         });
         let state = runner.run("fix it").await?;
         assert_eq!(state.workflow_phase, WorkflowPhase::Completed);
@@ -1528,6 +1663,7 @@ mod tests {
             context_profile: ContextProfile::default_32k(),
             system_prompt: "system".to_owned(),
             cancellation: CancellationToken::new(),
+            sessions: None,
         });
         let error = match runner.run("broken").await {
             Ok(_) => return Err("third identical failure did not stop".into()),

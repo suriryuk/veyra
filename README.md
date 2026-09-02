@@ -1,11 +1,12 @@
-# Veyra v0.3
+# Veyra v0.4
 
 Veyra is a safe local coding-agent runtime written in Rust. It connects to an
 OpenAI-compatible `llama-server`, streams model output, inspects a configured
 workspace, applies approved edits, classifies Rust build/test failures, replans,
 and reviews the final Git diff before completing a changed task. A bounded Context
-Manager retrieves relevant source ranges and keeps every model request within an
-explicit 32K or 65K profile.
+Manager retrieves relevant source ranges and durable workspace memories while
+keeping every model request within an explicit 32K or 65K profile. SQLite-backed
+sessions preserve task, plan, message, Tool, approval, event, and audit history.
 
 ## Requirements
 
@@ -74,6 +75,9 @@ max_identical_failures = 3
 [context]
 profile = "default"
 
+[storage]
+database_path = "data/veyra.sqlite3"
+
 [tools]
 command_timeout_seconds = 120
 stdout_limit_bytes = 1048576
@@ -106,16 +110,60 @@ veyra
 veyra chat
 veyra run "inspect this project and fix the failing test"
 veyra --context-profile large run "analyze the repository architecture"
+veyra sessions list
+veyra sessions show <session-id> --json --all
+veyra sessions resume <session-id>
+veyra sessions prune --older-than 90
 veyra models status
 veyra tools list
 veyra config check
 ```
 
-`chat` starts a prompt loop; use `/quit`, `/exit`, or EOF to leave. Console input
+`chat` starts one durable session and records each prompt as a task in that session;
+use `/quit`, `/exit`, or EOF to leave. `run` creates a new single-task session and
+prints its ID. Console input
 supports UTF-8 and Windows-949/CP949 Korean text. Model tokens stream immediately,
 while workflow, Tool, failure-classification, context selection, estimated usage,
 actual server usage, and overflow-retry events are shown on stderr. The global
 `--context-profile` option overrides `[context].profile` for one invocation.
+
+## v0.4 sessions, memory, and audit
+
+SQLite at `storage.database_path` is the canonical durable store. Versioned,
+transactional migrations create normalized sessions, tasks, plans, messages, Tool
+calls, approvals, memories, events, and audit records. The legacy
+`logs/audit.jsonl` remains an append-only compatibility mirror with the same secret
+redaction policy.
+
+`sessions resume` requires the configured canonical workspace to match the stored
+workspace. A pending approval is cancelled on recovery and a requested or running
+Tool is marked interrupted. Veyra adds a Tool observation describing the interruption
+but never replays the Tool or reuses an `Allow once` decision automatically. Terminal
+sessions continue as a new task in the same conversation.
+
+Ctrl+C at an approval prompt performs a normal cancellation and exits the current
+CLI invocation without executing the Tool. To test crash recovery rather than normal
+cancellation, terminate the `veyra` process from another terminal (for example with
+`kill -9`) while the approval prompt is pending, then run `sessions resume`.
+`sessions show` reports normalized `tool_calls` and `approvals` rows as well as the
+event and audit streams, so recovered rows can be inspected as `interrupted` and
+`cancelled`. Token-usage counters remain visible; only credential-shaped token keys
+such as `api_token` are redacted.
+
+Successful tasks produce a deterministic summary memory without another model call.
+Only memories from the same canonical workspace with matching task terms are eligible
+for context. The default/large profiles reserve 1,024/2,048 tokens for memory; an
+overflow retry halves that allowance before rebuilding the request.
+
+Sessions are retained indefinitely. `sessions prune --older-than <days>` previews and
+confirms deletion of terminal SQLite sessions only; `--yes` enables non-interactive
+execution. Running sessions and append-only JSONL audit files are never pruned by this
+command.
+
+For backup, stop Veyra and copy the SQLite database together with any `-wal` and `-shm`
+files, or use SQLite's online `.backup` command. Restore all files while Veyra is
+stopped, then run `veyra config check`; startup applies pending migrations
+transactionally.
 
 ## v0.3 context optimization
 
@@ -229,25 +277,24 @@ redacted from arguments and summaries.
 
 - `agent-core`: bounded loop, workflow evaluator, failure fingerprints, events
 - `agent-context`: token budgets, retrieval, trimming, observation compression
+- `agent-storage`: SQLite migrations, session snapshots, memory and audit queries
 - `agent-model`: provider contract and OpenAI-compatible SSE adapter
 - `agent-tools`: workspace, Git, Cargo, command, output, and process-tree adapters
 - `agent-security`: workspace guard, risk/approval, redaction, JSONL audit
 - `agent-cli`: configuration, composition root, rendering, approval prompt
 
-Session persistence, Web/TUI, MCP/browser automation, document/vision support,
+Web/TUI, MCP/browser automation, document/vision support,
 remote Git operations, `Allow Always`, embeddings, vector databases, semantic
 reranking, and long-term memory retrieval remain out of scope.
 
 ## Verification status
 
-Veyra v0.3.0 has 42 automated tests covering the earlier approval, audit, workspace,
-workflow, Cargo, Git, and process contracts plus 32K/65K budgets, Unicode and long
-input bounds, Tool message pairing, observation compression, retrieval ranges and
-fallback exclusions, profile precedence, usage events, and one-shot overflow
-recovery. The workspace quality gates pass under WSL2 Ubuntu 24.04 with Rust 1.85.0.
-The live Qwen3-Coder/llama-server smoke test also passed with the default profile:
-automatic retrieval used ripgrep and server-reported usage produced
-`estimate=2417 actual=2373 delta=-44 retry=false`.
+Veyra v0.4.0 has 46 automated tests covering all prior contracts plus SQLite migration
+and reopen behavior, transactional snapshots, deterministic memory retrieval and
+budgeting, secret-redacted session history, and one-shot interrupted approval/Tool
+normalization. The workspace build, format, strict Clippy, and test gates pass under
+WSL2 Ubuntu 24.04 with Rust 1.85.0. The latest live Qwen3-Coder/llama-server smoke test
+remains the v0.3 baseline; no server was available during this v0.4 verification.
 
-See [`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md) for release details. The
+See [`docs/releases/v0.4.0.md`](docs/releases/v0.4.0.md) for release details. The
 `docs/` directory is intentionally local and Git-ignored.

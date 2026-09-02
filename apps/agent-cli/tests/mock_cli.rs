@@ -42,9 +42,10 @@ async fn cli_run_checks_health_and_streams_mock_response() -> Result<(), Box<dyn
     std::fs::write(
         &config_path,
         format!(
-            "[model]\nbase_url = \"http://{address}/v1\"\nmodel = \"mock\"\nrequest_timeout_seconds = 5\n\n[security]\nworkspace_root = {:?}\n\n[logging]\ndirectory = {:?}\n",
+            "[model]\nbase_url = \"http://{address}/v1\"\nmodel = \"mock\"\nrequest_timeout_seconds = 5\n\n[security]\nworkspace_root = {:?}\n\n[logging]\ndirectory = {:?}\n\n[storage]\ndatabase_path = {:?}\n",
             temp.path().join("work").display().to_string(),
-            temp.path().join("logs").display().to_string()
+            temp.path().join("logs").display().to_string(),
+            temp.path().join("data/veyra.sqlite3").display().to_string()
         ),
     )?;
     let output = Command::new(env!("CARGO_BIN_EXE_veyra"))

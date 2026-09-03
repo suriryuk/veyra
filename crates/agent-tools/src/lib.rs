@@ -197,13 +197,17 @@ impl ToolRegistry {
     }
 
     pub fn register<T: Tool + 'static>(&mut self, tool: T) -> Result<(), ToolError> {
+        self.register_arc(Arc::new(tool))
+    }
+
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolError> {
         let name = tool.definition().function.name;
         if self.tools.contains_key(&name) {
             return Err(ToolError::InvalidArguments(format!(
                 "duplicate tool name: {name}"
             )));
         }
-        self.tools.insert(name, Arc::new(tool));
+        self.tools.insert(name, tool);
         Ok(())
     }
 

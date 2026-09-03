@@ -4,6 +4,7 @@ members = [
     "apps/agent-cli",
     "crates/agent-context",
     "crates/agent-core",
+    "crates/agent-mcp",
     "crates/agent-model",
     "crates/agent-research",
     "crates/agent-security",
@@ -12,9 +13,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]
@@ -29,6 +30,7 @@ futures-util = "0.3"
 globset = "0.4"
 hex = "0.4"
 regex = "1"
+rmcp = { version = "3.2", default-features = false, features = ["client", "transport-child-process"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 scraper = "0.22"

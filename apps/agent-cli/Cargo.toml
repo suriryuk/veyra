@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 agent-context = { path = "../../crates/agent-context" }
 agent-core = { path = "../../crates/agent-core" }
+agent-mcp = { path = "../../crates/agent-mcp" }
 agent-model = { path = "../../crates/agent-model" }
 agent-research = { path = "../../crates/agent-research" }
 agent-security = { path = "../../crates/agent-security" }

@@ -526,6 +526,20 @@ impl AgentRunner {
                     .content
                     .unwrap_or_else(|| "Task completed without a textual response.".to_owned());
                 if let Some(requirement) = completion_requirement(&state, &answer) {
+                    let key = format!("workflow_completion:{requirement}");
+                    let occurrences = state.failure_counts.entry(key).or_default();
+                    *occurrences = occurrences.saturating_add(1);
+                    let occurrences = *occurrences;
+                    if occurrences >= self.limits.max_identical_failures {
+                        return self
+                            .fail(
+                                &mut state,
+                                AgentError::Limit(format!(
+                                    "identical completion requirement repeated {occurrences} times: {requirement}"
+                                )),
+                            )
+                            .await;
+                    }
                     state.messages.push(Message::system(format!(
                         "Workflow evaluator rejected completion: {requirement}. Continue with the required verification or review before answering."
                     )));
@@ -748,6 +762,44 @@ impl AgentRunner {
             &call.arguments,
             self.workspace.root(),
         );
+        if risk.requires_approval()
+            && state.observations.iter().any(|observation| {
+                observation.content["denied"] == true
+                    && observation.content["approval_fingerprint"] == request.fingerprint
+            })
+        {
+            let decision = ApprovalDecision::Denied {
+                decided_at: Utc::now(),
+            };
+            self.audit(
+                state,
+                call_id,
+                &call.name,
+                &call.arguments,
+                risk,
+                AuditPhase::Denied,
+                Some(decision),
+                None,
+                Some("identical Tool request was already denied by the user".to_owned()),
+                None,
+                false,
+            )
+            .await?;
+            return Ok(Observation {
+                tool_call_id: call_id,
+                tool_name: call.name.clone(),
+                summary: "identical Tool request remains denied".to_owned(),
+                content: json!({
+                    "denied":true,
+                    "approval_fingerprint":request.fingerprint,
+                    "reused_denial":true,
+                }),
+                truncated: false,
+                is_error: false,
+                workflow_phase: state.workflow_phase,
+                failure: None,
+            });
+        }
         let decision = if risk.requires_approval() {
             self.set_status(state, AgentStatus::AwaitingApproval).await;
             self.emit(
@@ -803,7 +855,11 @@ impl AgentRunner {
                 tool_call_id: call_id,
                 tool_name: call.name.clone(),
                 summary: "tool execution denied by user".to_owned(),
-                content: json!({"denied":true}),
+                content: json!({
+                    "denied":true,
+                    "approval_fingerprint":request.fingerprint,
+                    "reused_denial":false,
+                }),
                 truncated: false,
                 is_error: false,
                 workflow_phase: state.workflow_phase,
@@ -1142,17 +1198,19 @@ fn completion_requirement(state: &AgentState, answer: &str) -> Option<&'static s
         .observations
         .iter()
         .any(|observation| observation.tool_name == "http_fetch");
-    let fetched_urls = state.observations.iter().filter_map(|observation| {
-        if observation.tool_name == "http_fetch" && !observation.is_error {
+    let verified_urls = state.observations.iter().filter_map(|observation| {
+        let browser_evidence = observation.content["kind"] == "browser"
+            && observation.tool_name.ends_with("browser_snapshot");
+        if !observation.is_error && (observation.tool_name == "http_fetch" || browser_evidence) {
             observation.content["source"]["final_url"].as_str()
         } else {
             None
         }
     });
-    let mut fetched = false;
+    let mut verified = false;
     let mut cited = false;
-    for url in fetched_urls {
-        fetched = true;
+    for url in verified_urls {
+        verified = true;
         cited |= answer.contains(url);
     }
     if task_requires_web_research(&state.task) && !searched {
@@ -1161,8 +1219,18 @@ fn completion_requirement(state: &AgentState, answer: &str) -> Option<&'static s
     if searched && !fetch_attempted {
         return Some("web search results must be verified with http_fetch before answering");
     }
-    if fetched && !cited {
-        return Some("the final answer must cite at least one successfully fetched final URL");
+    let browser_snapshot = state.observations.iter().any(|observation| {
+        !observation.is_error
+            && observation.content["kind"] == "browser"
+            && observation.tool_name.ends_with("browser_snapshot")
+    });
+    if task_requires_browser_interaction(&state.task) && !browser_snapshot {
+        return Some(
+            "the user explicitly requested browser interaction, but no browser snapshot succeeded",
+        );
+    }
+    if verified && !cited {
+        return Some("the final answer must cite at least one successfully verified final URL");
     }
     if state.change_sequence == 0 {
         return None;
@@ -1197,31 +1265,38 @@ fn task_requires_web_research(task: &str) -> bool {
     ]
     .iter()
     .any(|marker| task.contains(marker));
-    let korean_code_change = ["구현", "수정", "리팩터", "코드", "파일", "저장소"]
-        .iter()
-        .any(|marker| task.contains(marker));
-    let english_code_change = [
-        "implement",
-        "implementation",
-        "fix",
-        "refactor",
-        "code",
-        "file",
-        "files",
-        "repository",
+    let negative_search = [
+        "검색하지 마",
+        "검색하지마",
+        "검색 없이",
+        "검색 금지",
+        "do not search",
+        "don't search",
+        "without search",
+        "do not use web_search",
+        "don't use web_search",
     ]
     .iter()
-    .any(|marker| words.contains(marker));
-    let code_change = korean_code_change || english_code_change;
+    .any(|marker| task.contains(marker))
+        || (task.contains("web_search")
+            && ["사용하지 마", "사용하지마", "금지"]
+                .iter()
+                .any(|marker| task.contains(marker)));
+    if negative_search {
+        return false;
+    }
     if direct_research {
         return true;
     }
-    if code_change {
+    if task_is_code_change(&task, &words) {
         return false;
     }
-    let research_action = ["검색", "조사", "search", "research", "look up"]
+    let korean_research_action = ["검색", "조사"].iter().any(|marker| task.contains(marker));
+    let english_research_action = ["search", "research"]
         .iter()
-        .any(|marker| task.contains(marker));
+        .any(|marker| words.contains(marker))
+        || task.contains("look up");
+    let research_action = korean_research_action || english_research_action;
     let evidence_request = [
         "원문", "출처", "링크", "url", "source", "citation", "cite", "link",
     ]
@@ -1231,6 +1306,61 @@ fn task_requires_web_research(task: &str) -> bool {
         .iter()
         .any(|marker| task.contains(marker));
     research_action && (evidence_request || freshness_request)
+}
+
+fn task_requires_browser_interaction(task: &str) -> bool {
+    let task = task.to_lowercase();
+    let words = task
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if task_is_code_change(&task, &words) {
+        return false;
+    }
+    let negative_browser = [
+        "브라우저를 사용하지 마",
+        "브라우저 사용하지 마",
+        "브라우저 없이",
+        "do not use the browser",
+        "don't use the browser",
+        "without a browser",
+    ]
+    .iter()
+    .any(|marker| task.contains(marker));
+    if negative_browser {
+        return false;
+    }
+    [
+        "mcp__playwright__browser_",
+        "playwright browser를 사용",
+        "playwright 브라우저를 사용",
+        "브라우저만 사용",
+        "브라우저로 이동",
+        "use the playwright browser",
+        "use the browser",
+        "open in the browser",
+        "navigate with playwright",
+    ]
+    .iter()
+    .any(|marker| task.contains(marker))
+}
+
+fn task_is_code_change(task: &str, words: &[&str]) -> bool {
+    ["구현", "수정", "리팩터", "코드", "파일", "저장소"]
+        .iter()
+        .any(|marker| task.contains(marker))
+        || [
+            "implement",
+            "implementation",
+            "fix",
+            "refactor",
+            "code",
+            "file",
+            "files",
+            "repository",
+        ]
+        .iter()
+        .any(|marker| words.contains(marker))
 }
 
 fn duplicate_web_search_result(state: &AgentState, call: &RequestedToolCall) -> Option<ToolResult> {
@@ -1465,6 +1595,16 @@ mod tests {
     #[async_trait]
     impl ApprovalProvider for Deny {
         async fn decide(&self, _: &ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::Denied {
+                decided_at: Utc::now(),
+            }
+        }
+    }
+    struct CountingDeny(Arc<AtomicUsize>);
+    #[async_trait]
+    impl ApprovalProvider for CountingDeny {
+        async fn decide(&self, _: &ApprovalRequest) -> ApprovalDecision {
+            self.0.fetch_add(1, Ordering::SeqCst);
             ApprovalDecision::Denied {
                 decided_at: Utc::now(),
             }
@@ -1823,6 +1963,126 @@ mod tests {
         assert!(task_requires_web_research(
             "research the latest profile sources"
         ));
+        assert!(!task_requires_web_research(
+            "최종 URL을 확인하되 web_search와 http_fetch는 사용하지 마"
+        ));
+        assert!(!task_requires_web_research(
+            "do not use web_search; return the final URL from the browser"
+        ));
+        assert!(task_requires_browser_interaction(
+            "반드시 mcp__playwright__browser_navigate와 browser_snapshot을 사용해줘"
+        ));
+        assert!(!task_requires_browser_interaction(
+            "브라우저 없이 정적 페이지를 확인해줘"
+        ));
+    }
+
+    #[test]
+    fn browser_snapshot_final_url_satisfies_research_citation_gate() {
+        let observation = |tool_name: &str, content: Value, is_error: bool| Observation {
+            tool_call_id: ToolCallId::new(),
+            tool_name: tool_name.to_owned(),
+            summary: tool_name.to_owned(),
+            content,
+            truncated: false,
+            is_error,
+            workflow_phase: WorkflowPhase::Discovery,
+            failure: None,
+        };
+        let state = AgentState {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            workspace: ".".to_owned(),
+            task: "웹에서 검색하고 동적 페이지 원문을 확인해줘".to_owned(),
+            status: AgentStatus::Thinking,
+            plan: Vec::new(),
+            messages: Vec::new(),
+            observations: vec![
+                observation("web_search", json!({"query":"dynamic page"}), false),
+                observation("http_fetch", json!({"error":"requires JavaScript"}), true),
+                observation(
+                    "mcp__playwright__browser_snapshot",
+                    json!({
+                        "kind":"browser",
+                        "source":{"final_url":"https://example.com/dynamic"}
+                    }),
+                    false,
+                ),
+            ],
+            iteration: 1,
+            tool_calls: 3,
+            consecutive_errors: 0,
+            workflow_phase: WorkflowPhase::Discovery,
+            change_sequence: 0,
+            last_successful_verification: None,
+            last_diff_review: None,
+            failure_counts: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            completion_requirement(&state, "출처: https://example.com/dynamic"),
+            None
+        );
+        assert_eq!(
+            completion_requirement(&state, "확인했습니다."),
+            Some("the final answer must cite at least one successfully verified final URL")
+        );
+
+        let mut browser_only = state.clone();
+        browser_only.task = "반드시 mcp__playwright__browser_navigate와 mcp__playwright__browser_snapshot으로 최종 URL을 확인해줘. web_search와 http_fetch는 사용하지 마".to_owned();
+        browser_only.observations = vec![state.observations[2].clone()];
+        assert_eq!(
+            completion_requirement(&browser_only, "https://example.com/dynamic"),
+            None
+        );
+        browser_only.observations.clear();
+        assert_eq!(
+            completion_requirement(&browser_only, "완료했습니다."),
+            Some(
+                "the user explicitly requested browser interaction, but no browser snapshot succeeded"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_completion_rejection_stops_at_identical_failure_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let answer = || ModelResponse {
+            content: Some("검색하지 않고 완료했습니다.".to_owned()),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: FinishReason::Stop,
+        };
+        let provider = FakeModel {
+            responses: Mutex::new(vec![answer(), answer(), answer()]),
+        };
+        let runner = AgentRunner::new(AgentRunnerConfig {
+            provider: Arc::new(provider),
+            registry: Arc::new(ToolRegistry::new()),
+            approver: Arc::new(Allow),
+            audit: Arc::new(Null),
+            events: Arc::new(Null),
+            workspace: WorkspaceGuard::new(temp.path())?,
+            limits: AgentLimits {
+                max_iterations: 10,
+                max_identical_failures: 3,
+                ..AgentLimits::default()
+            },
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+            sessions: None,
+        });
+        let result = runner.run("search the web for Rust and cite a URL").await;
+        assert!(matches!(
+            result,
+            Err(AgentError::Limit(message))
+                if message.contains("identical completion requirement repeated 3 times")
+        ));
+        Ok(())
     }
 
     #[test]
@@ -1886,6 +2146,59 @@ mod tests {
         assert!(!executed.load(Ordering::SeqCst));
         assert_eq!(state.observations.len(), 1);
         assert_eq!(state.observations[0].content["denied"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_denied_tool_request_is_not_prompted_or_executed_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let executed = Arc::new(AtomicBool::new(false));
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(SpyTool(executed.clone()))?;
+        let call = |id: &str| ModelResponse {
+            content: None,
+            tool_calls: vec![RequestedToolCall {
+                id: id.to_owned(),
+                name: "spy_write".to_owned(),
+                arguments: json!({}),
+            }],
+            usage: None,
+            finish_reason: FinishReason::ToolCalls,
+        };
+        let provider = FakeModel {
+            responses: Mutex::new(vec![
+                ModelResponse {
+                    content: Some("거부 결정을 유지했습니다.".to_owned()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    finish_reason: FinishReason::Stop,
+                },
+                call("second"),
+                call("first"),
+            ]),
+        };
+        let runner = AgentRunner::new(AgentRunnerConfig {
+            provider: Arc::new(provider),
+            registry: Arc::new(registry),
+            approver: Arc::new(CountingDeny(decisions.clone())),
+            audit: Arc::new(Null),
+            events: Arc::new(Null),
+            workspace: WorkspaceGuard::new(temp.path())?,
+            limits: AgentLimits::default(),
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+            sessions: None,
+        });
+        let state = runner.run("task").await?;
+        assert!(!executed.load(Ordering::SeqCst));
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(state.observations.len(), 2);
+        assert_eq!(state.observations[1].content["reused_denial"], true);
         Ok(())
     }
 

@@ -2,6 +2,7 @@ use agent_context::ContextProfile;
 use agent_core::{
     AgentError, AgentEvent, AgentEventSink, AgentLimits, AgentRunner, AgentRunnerConfig, AgentState,
 };
+use agent_mcp::{McpConfig, McpManager};
 use agent_model::Message;
 use agent_model::{ModelProvider, OpenAiCompatibleProvider, SamplingConfig};
 use agent_research::{FetchPolicy, HttpFetcher, SearxngProvider};
@@ -28,6 +29,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::prelude::*;
+
+const SYSTEM_PROMPT: &str = include_str!("../../../prompts/system.md");
 
 #[derive(Parser)]
 #[command(name = "veyra", version, about = "A safe local coding agent")]
@@ -129,6 +132,8 @@ enum CliError {
     Agent(#[from] agent_core::AgentError),
     #[error("storage failed: {0}")]
     Storage(String),
+    #[error("MCP setup failed: {0}")]
+    Mcp(#[from] agent_mcp::McpError),
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -138,6 +143,7 @@ struct AppConfig {
     model: ModelSection,
     context: Option<ContextSection>,
     research: ResearchSection,
+    mcp: McpConfig,
     security: SecuritySection,
     tools: ToolsSection,
     logging: LoggingSection,
@@ -250,7 +256,7 @@ impl Default for ResearchSection {
             max_redirects: 5,
             max_response_bytes: 2_097_152,
             max_results: 10,
-            user_agent: "Veyra/0.5".to_owned(),
+            user_agent: "Veyra/0.6".to_owned(),
         }
     }
 }
@@ -376,6 +382,7 @@ impl AppConfig {
             &self.research.user_agent,
         )
         .map_err(|error| CliError::Config(error.to_string()))?;
+        self.mcp.validate()?;
         for profile in [
             &self.tools.command_profiles.default,
             &self.tools.command_profiles.cargo_build,
@@ -640,13 +647,16 @@ async fn main() -> Result<(), CliError> {
         Commands::Tools {
             command: ToolCommand::List,
         } => {
-            let registry = registry(&config)?;
+            tokio::fs::create_dir_all(&config.security.workspace_root).await?;
+            let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
+            let (registry, manager) = registry(&config, &workspace).await?;
             for definition in registry.definitions() {
                 println!(
                     "{}\t{}",
                     definition.function.name, definition.function.description
                 );
             }
+            manager.shutdown().await;
             Ok(())
         }
         Commands::Models {
@@ -685,7 +695,7 @@ async fn chat_session(
     mut history: Vec<Message>,
 ) -> Result<(), CliError> {
     println!(
-        "Veyra v0.5 — session {}; context profile {}; enter a task, or /quit to exit.",
+        "Veyra v0.6 — session {}; context profile {}; enter a task, or /quit to exit.",
         session_id,
         context.name.as_str(),
     );
@@ -761,23 +771,28 @@ async fn run_task(
     task: String,
 ) -> Result<AgentState, CliError> {
     let database = Arc::new(storage(config).await?);
-    let runner = runner(config, context, database).await?;
-    runner
-        .run_in_session(session_id, history, task)
-        .await
-        .map_err(CliError::from)
+    let RunnerBundle { runner, mcp } = runner(config, context, database).await?;
+    let result = runner.run_in_session(session_id, history, task).await;
+    mcp.shutdown().await;
+    result.map_err(CliError::from)
+}
+
+struct RunnerBundle {
+    runner: AgentRunner,
+    mcp: McpManager,
 }
 
 async fn runner(
     config: &AppConfig,
     context: &ContextProfile,
     database: Arc<SqliteSessionRepository>,
-) -> Result<AgentRunner, CliError> {
+) -> Result<RunnerBundle, CliError> {
     tokio::fs::create_dir_all(&config.security.workspace_root).await?;
     let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
     let provider = Arc::new(provider(config)?);
     provider.health().await?;
-    let registry = Arc::new(registry(config)?);
+    let (registry, mcp) = registry(config, &workspace).await?;
+    let registry = Arc::new(registry);
     let jsonl = Arc::new(JsonlAuditSink::open(config.logging.directory.join("audit.jsonl")).await?);
     let audit_sinks: Vec<Arc<dyn agent_security::AuditSink>> = vec![database.clone(), jsonl];
     let audit = Arc::new(CompositeAuditSink::new(audit_sinks));
@@ -820,11 +835,11 @@ async fn runner(
             repeat_penalty: config.model.sampling.repeat_penalty,
         },
         context_profile: context.clone(),
-        system_prompt: include_str!("../../../prompts/system.md").to_owned(),
+        system_prompt: SYSTEM_PROMPT.to_owned(),
         cancellation,
         sessions: Some(database),
     });
-    Ok(runner)
+    Ok(RunnerBundle { runner, mcp })
 }
 
 async fn storage(config: &AppConfig) -> Result<SqliteSessionRepository, CliError> {
@@ -906,10 +921,11 @@ async fn sessions(
                     | agent_core::AgentStatus::Failed
                     | agent_core::AgentStatus::Cancelled
             ) {
-                let value = runner(config, context, database.clone())
-                    .await?
-                    .resume(state)
-                    .await?;
+                let RunnerBundle { runner, mcp } =
+                    runner(config, context, database.clone()).await?;
+                let resumed = runner.resume(state).await;
+                mcp.shutdown().await;
+                let value = resumed?;
                 state = value;
             }
             chat_session(config, context, state.session_id, state.messages).await?;
@@ -1039,7 +1055,10 @@ fn apply_command_overrides(
     limits
 }
 
-fn registry(config: &AppConfig) -> Result<ToolRegistry, CliError> {
+async fn registry(
+    config: &AppConfig,
+    workspace: &WorkspaceGuard,
+) -> Result<(ToolRegistry, McpManager), CliError> {
     let mut value = ToolRegistry::new();
     register_builtin_tools(&mut value)?;
     let timeout = Duration::from_secs(config.research.request_timeout_seconds);
@@ -1059,7 +1078,17 @@ fn registry(config: &AppConfig) -> Result<ToolRegistry, CliError> {
     ))
     .map_err(|error| CliError::Config(error.to_string()))?;
     register_research_tools(&mut value, provider, fetcher, config.research.max_results)?;
-    Ok(value)
+    let connected = McpManager::connect_enabled(&config.mcp, workspace).await?;
+    for diagnostic in &connected.diagnostics {
+        eprintln!("[mcp:{}] {}", diagnostic.server, diagnostic.message);
+    }
+    for tool in connected.tools {
+        let name = tool.definition().function.name;
+        if let Err(error) = value.register_arc(tool) {
+            eprintln!("[mcp:{name}] {error}; Tool skipped");
+        }
+    }
+    Ok((value, connected.manager))
 }
 
 fn provider(config: &AppConfig) -> Result<OpenAiCompatibleProvider, agent_model::ModelError> {
@@ -1154,9 +1183,12 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    #[test]
-    fn registry_includes_research_tools() -> Result<(), CliError> {
-        let definitions = registry(&AppConfig::default())?.definitions();
+    #[tokio::test]
+    async fn registry_includes_research_tools() -> Result<(), CliError> {
+        let temp = tempfile::tempdir()?;
+        let workspace = WorkspaceGuard::new(temp.path())?;
+        let (registry, manager) = registry(&AppConfig::default(), &workspace).await?;
+        let definitions = registry.definitions();
         assert!(
             definitions
                 .iter()
@@ -1167,6 +1199,7 @@ mod tests {
                 .iter()
                 .any(|definition| definition.function.name == "http_fetch")
         );
+        manager.shutdown().await;
         Ok(())
     }
 
@@ -1192,6 +1225,12 @@ mod tests {
                 .context_limit,
             65_536
         );
+    }
+
+    #[test]
+    fn embedded_system_prompt_requires_korean_responses() {
+        assert!(SYSTEM_PROMPT.contains("Write all assistant prose in Korean"));
+        assert!(SYSTEM_PROMPT.contains("switch languages"));
     }
 
     #[test]

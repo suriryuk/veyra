@@ -1,4 +1,4 @@
-# Veyra v0.5
+# Veyra v0.6
 
 Veyra is a safe local coding-agent runtime written in Rust. It connects to an
 OpenAI-compatible `llama-server`, streams model output, inspects a configured
@@ -7,15 +7,17 @@ and reviews the final Git diff before completing a changed task. A bounded Conte
 Manager retrieves relevant source ranges and durable workspace memories while
 keeping every model request within an explicit 32K or 65K profile. SQLite-backed
 sessions preserve task, plan, message, Tool, approval, event, and audit history.
-Veyra v0.5 adds source-traceable web research through SearXNG and a bounded,
-SSRF-resistant static-page fetcher with HTML main-content extraction.
+Veyra v0.6 adds opt-in stdio MCP servers and a headless Playwright workflow for
+dynamic pages. Discovered MCP Tools share the native Tool registry, approval,
+workspace confinement, result limits, and SQLite/JSONL audit path.
 
 ## Requirements
 
 - Windows 11 with WSL2 Ubuntu 24.04 (reference environment), or Linux
-- Rust 1.85.0; `rust-toolchain.toml` installs rustfmt and clippy
+- Rust 1.88.0; `rust-toolchain.toml` installs rustfmt and clippy
 - Git, Cargo, and preferably ripgrep for coding and automatic retrieval
 - A running OpenAI-compatible server for interactive use
+- Node.js 18 or newer only when the Playwright MCP server is enabled
 
 The repository uses Cargo's Rust-version fallback resolver and commits
 `Cargo.lock` so dependencies remain compatible with the MSRV.
@@ -86,7 +88,19 @@ request_timeout_seconds = 20
 max_redirects = 5
 max_response_bytes = 2097152
 max_results = 10
-user_agent = "Veyra/0.5"
+user_agent = "Veyra/0.6"
+
+[mcp]
+connect_timeout_seconds = 30
+call_timeout_seconds = 60
+max_result_bytes = 1048576
+
+[mcp.servers.playwright]
+enabled = false
+kind = "playwright"
+command = "npx"
+args = ["-y", "@playwright/mcp@0.0.80", "--headless", "--output-dir", ".veyra/browser"]
+pass_env = []
 
 [tools]
 command_timeout_seconds = 120
@@ -137,6 +151,50 @@ supports UTF-8 and Windows-949/CP949 Korean text. Model tokens stream immediatel
 while workflow, Tool, failure-classification, context selection, estimated usage,
 actual server usage, and overflow-retry events are shown on stderr. The global
 `--context-profile` option overrides `[context].profile` for one invocation.
+The bundled system prompt requires all assistant prose, including progress and final
+answers, to remain in Korean while preserving code, commands, URLs, identifiers, and
+verbatim errors where translation would reduce accuracy.
+
+## v0.6 MCP and browser
+
+MCP is disabled by default. Only entries with `enabled = true` are started, and
+`config check` validates their names, limits, environment allowlists, and command
+shape without launching a process. `tools list`, `chat`, and `run` connect enabled
+servers, discover all paginated Tool definitions, and report an individual server
+or Tool failure without removing native Tools or healthy MCP servers.
+
+Each discovered Tool is exposed as `mcp__<server>__<remote-tool>`; long names receive
+a stable hash suffix. Server commands are an executable plus argv, run with the
+canonical workspace as cwd and a minimal environment. Add only environment variable
+names—not values—to `pass_env` when a server needs one. Generic MCP Tools are Risk 3
+unless their exact remote name is listed under `risk.read`, `risk.modify`, or
+`risk.execute` for that server. Server annotations may raise, but never lower, risk.
+
+The bundled Playwright example pins `@playwright/mcp@0.0.80`, uses stdio, is headless,
+and writes artifacts beneath `.veyra/browser`. Snapshot and inspection actions are
+read-only; navigation, tab/window state, resize, screenshot, and PDF generation are
+Risk 1; click, typing, form actions, upload/drop, script execution, storage/cookie or
+network mutation, and unknown actions are Risk 3. Upload inputs and output filenames
+are revalidated against the workspace immediately before execution. A downloaded
+file is data only—executing it requires a separate approved command.
+
+The research order is Search → static `http_fetch` → Browser. Browser use is reserved
+for an explicit interaction request or a JavaScript/dynamic page that static fetch
+could not verify. An explicit Browser request is never replaced with static research
+solely because the target happens to be static, and cannot complete until a Browser
+snapshot succeeds. Negated Tool names such as “do not use web_search” do not create a
+research requirement. A successful `browser_snapshot` final URL is accepted by the same
+source/citation gate as `http_fetch`. MCP text and embedded text resources are bounded
+and marked as untrusted external data; image and binary blocks retain metadata only.
+There is no automatic restart or call replay after timeout, cancellation, disconnect,
+or malformed output.
+
+If Playwright discovery times out in WSL, verify `command -v node`, `node --version`,
+and `command -v npx` inside that same distribution. Install Node.js 18+ natively in
+WSL; a Windows `npx` path inherited through interop can print its version yet fail to
+provide a reliable bidirectional stdio server. Also confirm the pinned package can run
+with `npx -y @playwright/mcp@0.0.80 --version` and install the required browser runtime
+according to the Playwright MCP diagnostics before retrying `veyra tools list`.
 
 ## v0.5 web research
 
@@ -171,7 +229,9 @@ add `--json` for compact machine-readable output.
 redirects, validates and pins DNS results on every redirect, rejects local/private,
 link-local, reserved, and metadata-service addresses, follows at most five redirects,
 and enforces the configured timeout and byte limit while streaming. JavaScript
-rendering, cookies/login, forms, uploads, downloads, and crawling are not supported.
+rendering is delegated to the explicitly enabled browser workflow. Credential
+storage/automatic input, captcha bypass, background crawling, and automatic execution
+of downloaded files are not supported.
 Operators remain responsible for each site's terms and robots policy.
 
 ## v0.4 sessions, memory, and audit
@@ -277,6 +337,7 @@ Read-only tools run automatically:
 - Workspace: `list_directory`, `read_file`, `read_file_range`, `glob`, `grep`
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, and branch listing
 - Web: `web_search` and static GET-only `http_fetch`
+- MCP: exact generic read allowlists and Playwright snapshot/inspection actions
 
 State-changing and process tools require an exact one-time approval:
 
@@ -284,6 +345,7 @@ State-changing and process tools require an exact one-time approval:
 - `cargo_build` and `cargo_test`
 - structured `run_command`
 - branch creation/switching, `git_commit`, and `git_checkpoint`
+- MCP actions classified as Risk 1–3, including all Playwright interaction actions
 
 `git_diff` supports working, staged, base-revision, and path-scoped views. The
 default working-tree review adds bounded pseudo-diffs for untracked, non-ignored
@@ -326,31 +388,30 @@ redacted from arguments and summaries.
 - `agent-core`: bounded loop, workflow evaluator, failure fingerprints, events
 - `agent-context`: token budgets, retrieval, trimming, observation compression
 - `agent-research`: SearXNG search, SSRF-resistant fetch, source DTOs, extraction
+- `agent-mcp`: stdio lifecycle, discovery, Tool adapter, result and browser policy
 - `agent-storage`: SQLite migrations, session snapshots, memory and audit queries
 - `agent-model`: provider contract and OpenAI-compatible SSE adapter
 - `agent-tools`: workspace, Git, Cargo, command, output, and process-tree adapters
 - `agent-security`: workspace guard, risk/approval, redaction, JSONL audit
 - `agent-cli`: configuration, composition root, rendering, approval prompt
 
-Web/TUI, MCP/browser automation, dynamic-page rendering, document/vision support,
-remote Git operations, `Allow Always`, embeddings, vector databases, semantic
-reranking, and long-term memory retrieval remain out of scope.
+Web/TUI, remote/HTTP MCP transports, Browser GUI/takeover, credential automation,
+background crawling, document/vision support, remote Git operations, `Allow Always`,
+embeddings, vector databases, semantic reranking, and long-term memory retrieval
+remain out of scope.
 
 ## Verification status
 
-Veyra v0.5.0 has 74 automated tests covering all prior contracts plus SearXNG JSON search,
-URL deduplication, HTML/text extraction, SSRF address policy, DNS-pinned redirect
-handling, response limits, cancellation, research completion/citation gates, and
-session/audit source persistence, duplicate-query suppression, concise research session
-views, explicit research-intent enforcement, stream/diagnostic separation, and
-search-limit rendering. The workspace build, format, strict Clippy, and test
-gates pass under WSL2 Ubuntu 24.04 with Rust 1.85.0. A live local SearXNG and
-Qwen3-Coder/llama-server smoke test also completed a search, fetched two public static
-sources, cited their final URLs, and preserved bounded source metadata. A direct
-`http_fetch` of the local SearXNG address was rejected as required by the SSRF policy.
-An additional live acceptance test on 2026-09-03 confirmed that a memory-backed
-answer could not bypass an explicit research request and that context diagnostics no
-longer attach to streamed prose or citation URLs.
+Veyra v0.6.0 has 90 automated tests covering all prior contracts plus MCP naming,
+risk overrides, schema and argument rejection, bounded text/resource conversion,
+binary omission, timeout/cancellation, startup isolation, pre-call upload confinement,
+Playwright source/output-path metadata, denial replay suppression, negated search-intent handling, bounded completion rejection,
+and browser-backed research citation gates. The workspace
+build, format, strict Clippy, and test gates pass under WSL2 Ubuntu 24.04 with Rust
+1.88.0. With llama-server and the pinned Playwright MCP package, live headless smoke
+tests completed navigation, snapshot, approved click, denied form input without
+dispatch or repeated approval, workspace-confined download, and SQLite audit metadata
+inspection. The prior live SearXNG v0.5 smoke result also remains valid.
 
-See [`docs/releases/v0.5.0.md`](docs/releases/v0.5.0.md) for release details. The
+See [`docs/releases/v0.6.0.md`](docs/releases/v0.6.0.md) for release details. The
 `docs/` directory is intentionally local and Git-ignored.

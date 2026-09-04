@@ -51,6 +51,8 @@ struct Cli {
     workspace: Option<PathBuf>,
     #[arg(long, global = true, value_enum)]
     context_profile: Option<ContextProfileArg>,
+    #[arg(long, global = true)]
+    server_url: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -58,6 +60,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Chat,
+    Serve {
+        #[arg(long)]
+        bind: Option<String>,
+    },
+    Tui,
     Run {
         task: String,
     },
@@ -758,8 +765,10 @@ async fn main() -> Result<(), CliError> {
         config: config_path,
         workspace,
         context_profile,
+        server_url,
         command,
     } = Cli::parse();
+    let workspace_for_server = workspace.clone();
     let config = AppConfig::load(config_path.as_deref(), workspace)?;
     let selected_context = config.resolved_context_profile(context_profile);
     let _log_guard = init_logging(&config)?;
@@ -817,6 +826,9 @@ async fn main() -> Result<(), CliError> {
             }
             Ok(())
         }
+        Commands::Run { task } if server_url.is_some() => {
+            remote_run(server_url.as_deref().unwrap_or_default(), task).await
+        }
         Commands::Run { task } => {
             let state = run_task(
                 &config,
@@ -829,11 +841,160 @@ async fn main() -> Result<(), CliError> {
             println!("session_id={}", state.session_id);
             Ok(())
         }
+        Commands::Chat if server_url.is_some() => {
+            remote_chat(server_url.as_deref().unwrap_or_default()).await
+        }
         Commands::Chat => chat(&config, &selected_context).await,
+        Commands::Serve { bind } => serve(config_path.as_deref(), workspace_for_server, bind).await,
+        Commands::Tui => launch_tui(server_url.as_deref()),
         Commands::Sessions { command } => sessions(&config, &selected_context, command).await,
         Commands::Documents { command } => documents(&config, command).await,
         Commands::Vision { command } => vision(&config, command).await,
     }
+}
+
+async fn serve(
+    config_path: Option<&Path>,
+    workspace: Option<PathBuf>,
+    bind: Option<String>,
+) -> Result<(), CliError> {
+    let mut config = agent_app::AppConfig::load(config_path, workspace)
+        .map_err(|e| CliError::Config(e.to_string()))?;
+    if let Some(bind) = bind {
+        config.server.bind = bind;
+    }
+    let token = env::var("VEYRA_SERVER_TOKEN").ok();
+    let (address, token) =
+        agent_server::validate_bind(&config.server.bind, config.server.allow_remote, token)
+            .map_err(|e| CliError::Config(e.to_string()))?;
+    let frontend = config.server.frontend_directory.clone();
+    let service = agent_app::ApplicationService::open(config)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?;
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    println!("Veyra v0.9 server: http://{address}");
+    axum::serve(listener, agent_server::router(service, token, frontend))
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))
+}
+
+fn launch_tui(server_url: Option<&str>) -> Result<(), CliError> {
+    let mut command = std::process::Command::new("agent-tui");
+    if let Some(url) = server_url {
+        command.arg("--server-url").arg(url);
+    }
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::Config(format!("agent-tui exited with {status}")))
+    }
+}
+
+fn remote_client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+fn remote_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+) -> reqwest::RequestBuilder {
+    let value = client.request(method, url);
+    if let Ok(token) = env::var("VEYRA_SERVER_TOKEN") {
+        value.bearer_auth(token)
+    } else {
+        value
+    }
+}
+async fn remote_run(server: &str, task: String) -> Result<(), CliError> {
+    let client = remote_client();
+    let base = server.trim_end_matches('/');
+    let session: serde_json::Value = remote_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/api/v1/sessions"),
+    )
+    .json(&serde_json::json!({"workspace":"."}))
+    .send()
+    .await
+    .map_err(|e| CliError::Config(e.to_string()))?
+    .error_for_status()
+    .map_err(|e| CliError::Config(e.to_string()))?
+    .json()
+    .await
+    .map_err(|e| CliError::Config(e.to_string()))?;
+    let id = session["id"]
+        .as_str()
+        .ok_or_else(|| CliError::Config("server did not return a session id".into()))?;
+    let value: serde_json::Value = remote_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/api/v1/sessions/{id}/messages"),
+    )
+    .json(&serde_json::json!({"message":task}))
+    .send()
+    .await
+    .map_err(|e| CliError::Config(e.to_string()))?
+    .error_for_status()
+    .map_err(|e| CliError::Config(e.to_string()))?
+    .json()
+    .await
+    .map_err(|e| CliError::Config(e.to_string()))?;
+    println!(
+        "session_id={id}\ntask_id={}",
+        value["task_id"].as_str().unwrap_or("-")
+    );
+    Ok(())
+}
+async fn remote_chat(server: &str) -> Result<(), CliError> {
+    let client = remote_client();
+    let base = server.trim_end_matches('/');
+    let session: serde_json::Value = remote_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{base}/api/v1/sessions"),
+    )
+    .json(&serde_json::json!({"workspace":"."}))
+    .send()
+    .await
+    .map_err(|e| CliError::Config(e.to_string()))?
+    .error_for_status()
+    .map_err(|e| CliError::Config(e.to_string()))?
+    .json()
+    .await
+    .map_err(|e| CliError::Config(e.to_string()))?;
+    let id = session["id"]
+        .as_str()
+        .ok_or_else(|| CliError::Config("server did not return a session id".into()))?
+        .to_owned();
+    println!("Veyra v0.9 remote session {id}; enter a task, or /quit to exit.");
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+        let Some(line) = read_console_line()? else {
+            break;
+        };
+        let message = line.trim();
+        if matches!(message, "/quit" | "/exit") {
+            break;
+        }
+        if message.is_empty() {
+            continue;
+        }
+        let response = remote_request(
+            &client,
+            reqwest::Method::POST,
+            format!("{base}/api/v1/sessions/{id}/messages"),
+        )
+        .json(&serde_json::json!({"message":message}))
+        .send()
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?;
+        if !response.status().is_success() {
+            eprintln!("server: {}", response.text().await.unwrap_or_default());
+        }
+    }
+    Ok(())
 }
 
 async fn chat(config: &AppConfig, context: &ContextProfile) -> Result<(), CliError> {
@@ -847,7 +1008,7 @@ async fn chat_session(
     mut history: Vec<Message>,
 ) -> Result<(), CliError> {
     println!(
-        "Veyra v0.8 — session {}; context profile {}; enter a task, or /quit to exit.",
+        "Veyra v0.9 — session {}; context profile {}; enter a task, or /quit to exit.",
         session_id,
         context.name.as_str(),
     );

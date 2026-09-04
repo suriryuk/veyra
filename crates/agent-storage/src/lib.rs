@@ -165,6 +165,22 @@ pub struct SessionSummary {
     pub recent_task: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEvent {
+    pub id: i64,
+    pub session_id: String,
+    pub task_id: String,
+    pub event: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveApproval {
+    Resolved,
+    NotFound,
+    AlreadyResolved,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteSessionRepository {
     path: PathBuf,
@@ -204,6 +220,139 @@ impl SqliteSessionRepository {
         }).await.map_err(|error| error.to_string())?
     }
 
+    pub async fn create_session(&self, id: &str, workspace: &str) -> Result<(), String> {
+        let path = self.path.clone();
+        let id = id.to_owned();
+        let workspace = workspace.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = connect(&path)?;
+            let now = Utc::now().to_rfc3339();
+            connection.execute(
+                "INSERT INTO sessions(id,workspace,status,created_at,updated_at) VALUES(?1,?2,'ready',?3,?3)",
+                params![id, workspace, now],
+            ).map_err(display)?;
+            Ok(())
+        }).await.map_err(|error| error.to_string())?
+    }
+
+    pub async fn events_after(
+        &self,
+        session_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let path = self.path.clone();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = connect(&path)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT id,session_id,task_id,event_json,created_at FROM events
+                 WHERE session_id=?1 AND id>?2 ORDER BY id ASC LIMIT ?3",
+                )
+                .map_err(display)?;
+            let rows = statement
+                .query_map(
+                    params![session_id, after, i64::try_from(limit).unwrap_or(i64::MAX)],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .map_err(display)?;
+            rows.map(|row| {
+                let (id, session_id, task_id, event, created_at) = row.map_err(display)?;
+                Ok(StoredEvent {
+                    id,
+                    session_id,
+                    task_id,
+                    event: parse_json(&event)?,
+                    created_at,
+                })
+            })
+            .collect()
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    pub async fn latest_event(&self, session_id: &str) -> Result<Option<StoredEvent>, String> {
+        let path = self.path.clone();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = connect(&path)?;
+            connection.query_row(
+                "SELECT id,session_id,task_id,event_json,created_at FROM events WHERE session_id=?1 ORDER BY id DESC LIMIT 1",
+                [session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
+            ).optional().map_err(display)?.map(|(id, session_id, task_id, event, created_at)| {
+                Ok(StoredEvent { id, session_id, task_id, event: parse_json(&event)?, created_at })
+            }).transpose()
+        }).await.map_err(|error| error.to_string())?
+    }
+
+    pub async fn resolve_approval(
+        &self,
+        approval_id: &str,
+        decision: &ApprovalDecision,
+    ) -> Result<ResolveApproval, String> {
+        let path = self.path.clone();
+        let approval_id = approval_id.to_owned();
+        let decision = serde_json::to_string(decision).map_err(display)?;
+        tokio::task::spawn_blocking(move || {
+            let connection = connect(&path)?;
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM approvals WHERE approval_id=?1)",
+                    [&approval_id],
+                    |row| row.get(0),
+                )
+                .map_err(display)?;
+            if !exists {
+                return Ok(ResolveApproval::NotFound);
+            }
+            let changed = connection
+                .execute(
+                    "UPDATE approvals SET decision_json=?1,status='resolved',updated_at=?2
+                 WHERE approval_id=?3 AND status='pending'",
+                    params![decision, Utc::now().to_rfc3339(), approval_id],
+                )
+                .map_err(display)?;
+            Ok(if changed == 1 {
+                ResolveApproval::Resolved
+            } else {
+                ResolveApproval::AlreadyResolved
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    pub async fn approval(&self, approval_id: &str) -> Result<Option<Value>, String> {
+        let path = self.path.clone();
+        let approval_id = approval_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = connect(&path)?;
+            connection.query_row(
+                "SELECT request_json,fingerprint,status,decision_json,updated_at FROM approvals WHERE approval_id=?1",
+                [approval_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?)),
+            ).optional().map_err(display)?.map(|(request, fingerprint, status, decision, updated_at)| {
+                Ok(json!({
+                    "request": parse_json(&request)?, "fingerprint": fingerprint,
+                    "status": status,
+                    "decision": decision.map(|value| parse_json(&value)).transpose()?,
+                    "updated_at": updated_at,
+                }))
+            }).transpose()
+        }).await.map_err(|error| error.to_string())?
+    }
+
     pub async fn show_session(&self, id: &str, limit: Option<usize>) -> Result<Value, String> {
         let path = self.path.clone();
         let id = id.to_owned();
@@ -218,6 +367,48 @@ impl SqliteSessionRepository {
         tokio::task::spawn_blocking(move || research_view(&path, &id, limit))
             .await
             .map_err(|error| error.to_string())?
+    }
+
+    pub async fn show_task(&self, id: &str) -> Result<Option<Value>, String> {
+        let path = self.path.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let connection = connect(&path)?;
+            connection
+                .query_row("SELECT snapshot_json FROM tasks WHERE id=?1", [id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(display)?
+                .map(|value| parse_json(&value))
+                .transpose()
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    pub async fn audit_events(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
+        let path = self.path.clone();
+        let session_id = session_id.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let connection = connect(&path)?;
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut values = Vec::new();
+            if let Some(session_id) = session_id {
+                let mut statement = connection.prepare("SELECT event_json FROM audit_events WHERE session_id=?1 ORDER BY id DESC LIMIT ?2").map_err(display)?;
+                let rows = statement.query_map(params![session_id, limit], |row| row.get::<_, String>(0)).map_err(display)?;
+                for row in rows { values.push(parse_json(&row.map_err(display)?)?); }
+            } else {
+                let mut statement = connection.prepare("SELECT event_json FROM audit_events ORDER BY id DESC LIMIT ?1").map_err(display)?;
+                let rows = statement.query_map([limit], |row| row.get::<_, String>(0)).map_err(display)?;
+                for row in rows { values.push(parse_json(&row.map_err(display)?)?); }
+            }
+            Ok(values)
+        }).await.map_err(|error| error.to_string())?
     }
 
     pub async fn load_latest(&self, id: &str) -> Result<AgentState, String> {
@@ -1619,6 +1810,65 @@ mod tests {
         assert!(!shown.to_string().contains("must-not-persist"));
         assert_eq!(shown["tool_calls"][0]["status"], "interrupted");
         assert_eq!(shown["approvals"][0]["status"], "cancelled");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_resolution_is_atomic_and_events_replay_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = SqliteSessionRepository::open(temp.path().join("approval.db")).await?;
+        let value = state(temp.path());
+        let call_id = ToolCallId::new();
+        repository
+            .checkpoint(
+                &value,
+                Some(&AgentEvent::ToolRequested {
+                    call_id,
+                    model_call_id: "model-call".into(),
+                    name: "run_command".into(),
+                    arguments: json!({"program":"cargo","api_key":"secret"}),
+                    risk: RiskLevel::Execute,
+                }),
+            )
+            .await?;
+        let request = ApprovalRequest::for_tool(
+            call_id,
+            "run_command",
+            RiskLevel::Execute,
+            &json!({"program":"cargo"}),
+            temp.path(),
+        );
+        repository
+            .checkpoint(
+                &value,
+                Some(&AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                }),
+            )
+            .await?;
+        let decision = ApprovalDecision::AllowedOnce {
+            decided_at: Utc::now(),
+            fingerprint: request.fingerprint.clone(),
+        };
+        assert_eq!(
+            repository
+                .resolve_approval(&request.approval_id.to_string(), &decision)
+                .await?,
+            ResolveApproval::Resolved
+        );
+        assert_eq!(
+            repository
+                .resolve_approval(&request.approval_id.to_string(), &decision)
+                .await?,
+            ResolveApproval::AlreadyResolved
+        );
+        let events = repository
+            .events_after(&value.session_id.to_string(), 0, 10)
+            .await?;
+        assert_eq!(events.len(), 2);
+        assert!(events[0].id < events[1].id);
+        assert_eq!(events[0].event["arguments"]["api_key"], "[REDACTED]");
         Ok(())
     }
 }

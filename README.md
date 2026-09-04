@@ -1,4 +1,4 @@
-# Veyra v0.8
+# Veyra v0.9
 
 Veyra is a safe local coding-agent runtime written in Rust. It connects to an
 OpenAI-compatible `llama-server`, streams model output, inspects a configured
@@ -7,9 +7,10 @@ and reviews the final Git diff before completing a changed task. A bounded Conte
 Manager retrieves relevant source ranges and durable workspace memories while
 keeping every model request within an explicit 32K or 65K profile. SQLite-backed
 sessions preserve task, plan, message, Tool, approval, event, and audit history.
-Veyra v0.8 adds router-managed coding/vision model selection, bounded local image
-analysis, and page-level Vision fallback for scanned and mixed PDFs. Documents remain
-source-addressable and searchable without placing whole files in model context.
+Veyra v0.9 adds a server-owned runtime, versioned Axum API, replayable SSE events,
+a React control surface, and a ratatui client. CLI, TUI, and Web clients can operate
+the same durable session and resolve each approval exactly once. Repository selection
+remains confined to the configured workspace root.
 
 ## Requirements
 
@@ -18,7 +19,7 @@ source-addressable and searchable without placing whole files in model context.
 - Git, Cargo, and preferably ripgrep for coding and automatic retrieval
 - Poppler `pdftoppm` for scanned-PDF fallback
 - A running llama.cpp router for interactive coding/vision use
-- Node.js 18 or newer only when the Playwright MCP server is enabled
+- Node.js 22 or newer for the Web frontend or Playwright MCP server
 
 The repository uses Cargo's Rust-version fallback resolver and commits
 `Cargo.lock` so dependencies remain compatible with the MSRV.
@@ -30,6 +31,13 @@ cargo build --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+
+cd frontend
+npm install
+npm run lint
+npm run typecheck
+npm run test
+npm run build
 ```
 
 The automated suite uses a mock HTTP/SSE server, temporary Git repositories,
@@ -106,7 +114,12 @@ request_timeout_seconds = 20
 max_redirects = 5
 max_response_bytes = 2097152
 max_results = 10
-user_agent = "Veyra/0.8"
+user_agent = "Veyra/0.9"
+
+[server]
+bind = "127.0.0.1:3000"
+allow_remote = false
+frontend_directory = "frontend/dist"
 
 [mcp]
 connect_timeout_seconds = 30
@@ -166,6 +179,9 @@ veyra vision analyze architecture.png diagram.webp --prompt "구성 요소를 �
 veyra models status
 veyra tools list
 veyra config check
+veyra serve
+veyra tui
+veyra --server-url http://127.0.0.1:3000 run "inspect the workspace"
 ```
 
 `chat` starts one durable session and records each prompt as a task in that session;
@@ -178,6 +194,31 @@ actual server usage, and overflow-retry events are shown on stderr. The global
 The bundled system prompt requires all assistant prose, including progress and final
 answers, to remain in Korean while preserving code, commands, URLs, identifiers, and
 verbatim errors where translation would reduce accuracy.
+
+## v0.9 Web API and TUI
+
+Build `frontend/`, then start the server with `veyra serve` or
+`cargo run -p agent-server`. Open `http://127.0.0.1:3000` for the Web UI. The server
+serves the production frontend and the `/api/v1` session, task, approval, model,
+Tool, document, research, audit, and workspace APIs from one origin. The OpenAPI
+description is available at `/api/v1/openapi.json`.
+
+Agent events use SSE. `Last-Event-ID` or the `after` query parameter replays persisted
+events before the connection switches to live delivery. Message submission and
+approval decisions use ordinary HTTP POST requests. Concurrent approval decisions
+are resolved transactionally; only the first decision can resume the Tool.
+
+The default bind is loopback-only. A non-loopback bind requires both
+`server.allow_remote = true` and a non-empty `VEYRA_SERVER_TOKEN`; clients send it as
+`Authorization: Bearer ...`. The Web UI stores a supplied token only in browser
+session storage. A session may select the configured workspace root or a canonical
+subdirectory, never an arbitrary path or symlink escape.
+
+Run `cargo run -p agent-tui` (or `veyra tui` when the companion binary is installed)
+for the terminal interface. It provides session navigation, conversation, plan and
+context panels, activity refresh, message entry, and allow/deny shortcuts. Existing
+local `veyra chat` and `veyra run` remain compatible; `--server-url` selects client
+mode for a shared server-owned session.
 
 ## v0.8 Vision and scanned PDFs
 
@@ -461,9 +502,12 @@ redacted from arguments and summaries.
 - `agent-model`: provider contract, router manager, capabilities, and SSE adapter
 - `agent-tools`: workspace, Git, Cargo, command, output, and process-tree adapters
 - `agent-security`: workspace guard, risk/approval, redaction, JSONL audit
-- `agent-cli`: configuration, composition root, rendering, approval prompt
+- `agent-app`: shared server runtime, composition, active task and approval broker
+- `agent-server`: versioned HTTP/SSE API and production frontend hosting
+- `agent-tui`: terminal client for the shared API
+- `agent-cli`: compatible local workflow plus server/client launch commands
 
-Web/TUI, remote/HTTP MCP transports, Browser GUI/takeover, credential automation,
+Remote/HTTP MCP transports, Browser takeover, credential automation,
 background crawling, image generation/editing, video/audio, cloud Vision fallback,
 professional OCR/layout restoration, remote Git operations, `Allow Always`, embeddings,
 vector databases, semantic reranking, and long-term memory retrieval
@@ -471,12 +515,13 @@ remain out of scope.
 
 ## Verification status
 
-Veyra v0.8.0 has 110 passing automated tests covering router contracts, Vision image
-validation and multipart serialization, scanned-PDF provenance, migration v3, and
-Vision completion gates while retaining the v0.1-v0.7 regression suite. The workspace
-build, format, strict Clippy, and test gates pass under WSL2 Ubuntu 24.04 with Rust
-1.88.0. RTX 5080 16 GB에서 공식 Qwen3-VL image/scanned-PDF, coding route 복귀,
-VRAM 압박 및 child-failure 격리 smoke도 확인했다. 상세 결과는 local v0.8 release note에 있다.
+Veyra v0.9.0 has 116 Rust tests plus two frontend component tests. They
+cover the v0.1-v0.8 regression suite together with workspace-confined sessions,
+remote-bind policy, Bearer authentication, atomic approval resolution, redacted event
+replay, frontend reconnect deduplication, and approval focus trapping. Rust build, format, strict Clippy, and
+test gates pass under WSL2 Ubuntu 24.04 with Rust 1.88.0; frontend lint, typecheck,
+test, and production build pass with Node.js 24. A localhost smoke test returned the
+production UI, OpenAPI v0.9.0, and consistent session creation/listing responses.
 
-See [`docs/releases/v0.8.0.md`](docs/releases/v0.8.0.md) for release details. The
+See [`docs/releases/v0.9.0.md`](docs/releases/v0.9.0.md) for release details. The
 `docs/` directory is intentionally local and Git-ignored.

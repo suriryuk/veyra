@@ -311,11 +311,23 @@ impl AgentRunner {
     pub async fn run_in_session(
         &self,
         session_id: SessionId,
+        history: Vec<Message>,
+        task: impl Into<String>,
+    ) -> Result<AgentState, AgentError> {
+        self.run_in_session_with_task(session_id, TaskId::new(), history, task)
+            .await
+    }
+
+    /// Starts a task with an ID allocated by an interface layer. This lets HTTP
+    /// clients receive a stable task identifier before the background run begins.
+    pub async fn run_in_session_with_task(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
         mut history: Vec<Message>,
         task: impl Into<String>,
     ) -> Result<AgentState, AgentError> {
         let task = task.into();
-        let task_id = TaskId::new();
         if history.is_empty() {
             history.push(Message::system(self.system_prompt.clone()));
         }

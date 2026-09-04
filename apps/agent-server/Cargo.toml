@@ -1,45 +1,32 @@
 [package]
-name = "agent-cli"
+name = "agent-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "veyra"
-path = "src/main.rs"
-
 [dependencies]
 agent-app = { path = "../../crates/agent-app" }
-agent-server = { path = "../agent-server" }
 agent-document = { path = "../../crates/agent-document" }
-agent-context = { path = "../../crates/agent-context" }
-agent-core = { path = "../../crates/agent-core" }
-agent-mcp = { path = "../../crates/agent-mcp" }
-agent-model = { path = "../../crates/agent-model" }
-agent-research = { path = "../../crates/agent-research" }
 agent-security = { path = "../../crates/agent-security" }
 agent-storage = { path = "../../crates/agent-storage" }
 agent-tools = { path = "../../crates/agent-tools" }
-agent-vision = { path = "../../crates/agent-vision" }
-async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
-encoding_rs.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
-toml.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
-tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-thiserror.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tower.workspace = true

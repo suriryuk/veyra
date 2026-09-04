@@ -1,0 +1,19 @@
+.workspace-actions {
+  display: flex;
+  gap: 7px;
+  margin-bottom: 10px;
+}
+
+.workspace-actions button {
+  border: 1px solid var(--line);
+  background: var(--raised);
+  color: #c7d4db;
+  padding: 5px 9px;
+  font: 0.72rem ui-monospace, monospace;
+  cursor: pointer;
+}
+
+.workspace-actions button:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+}

@@ -3,10 +3,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
-async fn read_request(socket: &mut TcpStream) -> std::io::Result<()> {
+async fn read_request(socket: &mut TcpStream) -> std::io::Result<String> {
     let mut buffer = vec![0_u8; 16_384];
-    let _ = socket.read(&mut buffer).await?;
-    Ok(())
+    let read = socket.read(&mut buffer).await?;
+    Ok(String::from_utf8_lossy(&buffer[..read]).into_owned())
 }
 
 async fn respond(socket: &mut TcpStream, content_type: &str, body: &str) -> std::io::Result<()> {
@@ -23,12 +23,46 @@ async fn cli_run_checks_health_and_streams_mock_response() -> Result<(), Box<dyn
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
+        let (mut initial_models, _) = listener.accept().await?;
+        assert!(
+            read_request(&mut initial_models)
+                .await?
+                .starts_with("GET /models")
+        );
+        respond(
+            &mut initial_models,
+            "application/json",
+            "{\"data\":[{\"id\":\"mock\",\"status\":{\"value\":\"unloaded\"},\"architecture\":{\"input_modalities\":[\"text\"]}}]}",
+        )
+        .await?;
+
+        let (mut load, _) = listener.accept().await?;
+        assert!(
+            read_request(&mut load)
+                .await?
+                .starts_with("POST /models/load")
+        );
+        respond(&mut load, "application/json", "{\"success\":true}").await?;
+
+        let (mut models, _) = listener.accept().await?;
+        assert!(read_request(&mut models).await?.starts_with("GET /models"));
+        respond(
+            &mut models,
+            "application/json",
+            "{\"data\":[{\"id\":\"mock\",\"status\":{\"value\":\"loaded\"},\"architecture\":{\"input_modalities\":[\"text\"]}}]}",
+        )
+        .await?;
+
         let (mut health, _) = listener.accept().await?;
-        read_request(&mut health).await?;
+        assert!(read_request(&mut health).await?.starts_with("GET /health"));
         respond(&mut health, "application/json", "{\"status\":\"ok\"}").await?;
 
         let (mut chat, _) = listener.accept().await?;
-        read_request(&mut chat).await?;
+        assert!(
+            read_request(&mut chat)
+                .await?
+                .starts_with("POST /v1/chat/completions")
+        );
         let events = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"mock answer\"},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"

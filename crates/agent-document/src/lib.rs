@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zip::ZipArchive;
 
@@ -44,10 +45,30 @@ pub struct DocumentSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DocumentMetadata {
     pub page_count: Option<u32>,
     pub byte_size: usize,
     pub warnings: Vec<String>,
+    pub pipeline_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionMethod {
+    #[default]
+    Text,
+    Vision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionConfidence {
+    High,
+    Medium,
+    Low,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +82,12 @@ pub struct DocumentChunk {
     pub start_offset: usize,
     pub end_offset: usize,
     pub token_count: usize,
+    #[serde(default)]
+    pub extraction_method: ExtractionMethod,
+    #[serde(default)]
+    pub confidence: ExtractionConfidence,
+    #[serde(default)]
+    pub limitations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +137,9 @@ pub struct DocumentSearchHit {
     pub score: f64,
     pub excerpt: String,
     pub citation: String,
+    pub extraction_method: ExtractionMethod,
+    pub confidence: ExtractionConfidence,
+    pub limitations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +242,9 @@ pub struct ParsedSection {
     pub text: String,
     pub page: Option<u32>,
     pub heading: Option<String>,
+    pub extraction_method: ExtractionMethod,
+    pub confidence: ExtractionConfidence,
+    pub limitations: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub struct ParsedDocument {
@@ -219,6 +252,26 @@ pub struct ParsedDocument {
     pub sections: Vec<ParsedSection>,
     pub page_count: Option<u32>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisionPageExtraction {
+    pub text: String,
+    pub confidence: ExtractionConfidence,
+    pub limitations: Vec<String>,
+}
+
+#[async_trait]
+pub trait ScannedPdfFallback: Send + Sync {
+    fn max_pages(&self) -> usize;
+    fn pipeline_fingerprint(&self) -> String;
+    async fn extract_page(
+        &self,
+        pdf_path: &Path,
+        source: &str,
+        page: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<VisionPageExtraction, DocumentError>;
 }
 
 #[derive(Clone)]
@@ -266,6 +319,7 @@ impl DocumentService {
                         page_count: None,
                         byte_size: bytes.len(),
                         warnings: Vec::new(),
+                        pipeline_fingerprint: None,
                     },
                     status: DocumentStatus::UnsupportedFormat,
                     error: Some("unsupported document format".into()),
@@ -311,6 +365,7 @@ impl DocumentService {
                         page_count: parsed.page_count,
                         byte_size: bytes.len(),
                         warnings: parsed.warnings,
+                        pipeline_fingerprint: None,
                     },
                     status,
                     error: if scanned {
@@ -347,6 +402,7 @@ impl DocumentService {
                         page_count: None,
                         byte_size: bytes.len(),
                         warnings: Vec::new(),
+                        pipeline_fingerprint: None,
                     },
                     status,
                     error: Some(message),
@@ -356,6 +412,124 @@ impl DocumentService {
             }
         }
     }
+
+    pub async fn parse_with_fallback(
+        &self,
+        workspace: &str,
+        relative_path: &str,
+        pdf_path: &Path,
+        bytes: &[u8],
+        fallback: Option<&dyn ScannedPdfFallback>,
+        cancellation: &CancellationToken,
+    ) -> Result<NormalizedDocument, DocumentError> {
+        let base = self.parse(workspace, relative_path, bytes)?;
+        if base.source.format != DocumentFormat::Pdf {
+            return Ok(base);
+        }
+        let pages = match pdf_extract::extract_text_from_mem_by_pages(bytes) {
+            Ok(pages) => pages,
+            Err(_) => return Ok(base),
+        };
+        let page_count = u32::try_from(pages.len()).ok();
+        let candidate_count = pages.iter().filter(|text| visible_chars(text) < 20).count();
+        if candidate_count == 0 {
+            return Ok(base);
+        }
+        let Some(fallback) = fallback else {
+            return Ok(base);
+        };
+        let mut sections = Vec::new();
+        let mut warnings = Vec::new();
+        let mut attempted = 0_usize;
+        let mut missing_pages = 0_usize;
+        for (index, text) in pages.into_iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(DocumentError::Parse(
+                    "vision fallback was cancelled".to_owned(),
+                ));
+            }
+            let page = u32::try_from(index + 1).ok();
+            let normalized = normalize(&text);
+            if visible_chars(&normalized) >= 20 {
+                sections.push(ParsedSection {
+                    text: normalized,
+                    page,
+                    heading: None,
+                    extraction_method: ExtractionMethod::Text,
+                    confidence: ExtractionConfidence::Unknown,
+                    limitations: Vec::new(),
+                });
+                continue;
+            }
+            let Some(page) = page else {
+                missing_pages += 1;
+                continue;
+            };
+            if attempted >= fallback.max_pages() {
+                missing_pages += 1;
+                warnings.push(format!(
+                    "page {page} exceeded the configured vision page limit"
+                ));
+                continue;
+            }
+            attempted += 1;
+            match fallback
+                .extract_page(pdf_path, relative_path, page, cancellation)
+                .await
+            {
+                Ok(extraction) if !extraction.text.trim().is_empty() => {
+                    sections.push(ParsedSection {
+                        text: normalize(&extraction.text),
+                        page: Some(page),
+                        heading: None,
+                        extraction_method: ExtractionMethod::Vision,
+                        confidence: extraction.confidence,
+                        limitations: extraction.limitations,
+                    });
+                }
+                Ok(_) => {
+                    missing_pages += 1;
+                    warnings.push(format!("page {page} vision extraction returned no text"));
+                }
+                Err(error) => {
+                    missing_pages += 1;
+                    warnings.push(format!("page {page} vision extraction failed: {error}"));
+                }
+            }
+        }
+        let id = stable_id(workspace, relative_path);
+        let (text, chunks) = chunk_sections(&id, &sections, &self.limits)?;
+        let has_text = !text.is_empty();
+        let status = if !has_text {
+            DocumentStatus::Failed
+        } else if missing_pages > 0 {
+            DocumentStatus::Partial
+        } else {
+            DocumentStatus::Ready
+        };
+        Ok(NormalizedDocument {
+            id,
+            workspace: workspace.to_owned(),
+            source: base.source,
+            title: base.title,
+            metadata: DocumentMetadata {
+                page_count,
+                byte_size: bytes.len(),
+                warnings,
+                pipeline_fingerprint: Some(fallback.pipeline_fingerprint()),
+            },
+            status,
+            error: (!has_text).then(|| {
+                format!("vision extraction failed for all {candidate_count} candidate pages")
+            }),
+            text,
+            chunks,
+        })
+    }
+}
+
+fn visible_chars(text: &str) -> usize {
+    text.chars().filter(|value| value.is_alphanumeric()).count()
 }
 
 pub fn format_from_path(path: &Path) -> Result<DocumentFormat, DocumentError> {
@@ -475,6 +649,9 @@ impl DocumentParser for HtmlParser {
                     text,
                     page: None,
                     heading: heading.clone(),
+                    extraction_method: ExtractionMethod::Text,
+                    confidence: ExtractionConfidence::Unknown,
+                    limitations: Vec::new(),
                 });
             }
         }
@@ -506,6 +683,9 @@ impl DocumentParser for PdfParser {
                     text,
                     page: u32::try_from(index + 1).ok(),
                     heading: None,
+                    extraction_method: ExtractionMethod::Text,
+                    confidence: ExtractionConfidence::Unknown,
+                    limitations: Vec::new(),
                 }
             })
             .collect();
@@ -579,6 +759,9 @@ impl DocumentParser for DocxParser {
                                 text,
                                 page: Some(page),
                                 heading: heading.clone(),
+                                extraction_method: ExtractionMethod::Text,
+                                confidence: ExtractionConfidence::Unknown,
+                                limitations: Vec::new(),
                             });
                         }
                     }
@@ -636,6 +819,9 @@ fn plain_document(text: String) -> ParsedDocument {
             text: normalize(&text),
             page: None,
             heading: None,
+            extraction_method: ExtractionMethod::Text,
+            confidence: ExtractionConfidence::Unknown,
+            limitations: Vec::new(),
         }],
         page_count: None,
         warnings: Vec::new(),
@@ -665,6 +851,9 @@ fn flush_section(
             text: value,
             page,
             heading,
+            extraction_method: ExtractionMethod::Text,
+            confidence: ExtractionConfidence::Unknown,
+            limitations: Vec::new(),
         });
     }
     text.clear();
@@ -714,6 +903,9 @@ fn chunk_sections(
                 heading: section.heading.clone(),
                 start_offset: start,
                 end_offset: end,
+                extraction_method: section.extraction_method.clone(),
+                confidence: section.confidence.clone(),
+                limitations: section.limitations.clone(),
             });
         }
     }
@@ -823,6 +1015,7 @@ fn walkdir(root: &Path) -> Result<Vec<PathBuf>, DocumentError> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Arc;
     use zip::write::SimpleFileOptions;
     #[test]
     fn text_and_markdown_preserve_utf8_offsets() -> Result<(), Box<dyn std::error::Error>> {
@@ -962,5 +1155,119 @@ mod tests {
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes)?;
         Ok(bytes)
+    }
+
+    struct FakeFallback;
+
+    #[async_trait]
+    impl ScannedPdfFallback for FakeFallback {
+        fn max_pages(&self) -> usize {
+            50
+        }
+        fn pipeline_fingerprint(&self) -> String {
+            "vision:test:144dpi:v1".to_owned()
+        }
+        async fn extract_page(
+            &self,
+            _: &Path,
+            _: &str,
+            page: u32,
+            _: &CancellationToken,
+        ) -> Result<VisionPageExtraction, DocumentError> {
+            Ok(VisionPageExtraction {
+                text: format!("Vision extracted searchable content from page {page}."),
+                confidence: ExtractionConfidence::High,
+                limitations: vec!["fixture".to_owned()],
+            })
+        }
+    }
+
+    struct LimitedFallback;
+
+    #[async_trait]
+    impl ScannedPdfFallback for LimitedFallback {
+        fn max_pages(&self) -> usize {
+            0
+        }
+        fn pipeline_fingerprint(&self) -> String {
+            "vision:test:limit".to_owned()
+        }
+        async fn extract_page(
+            &self,
+            _: &Path,
+            _: &str,
+            _: u32,
+            _: &CancellationToken,
+        ) -> Result<VisionPageExtraction, DocumentError> {
+            Err(DocumentError::Parse("must not be called".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_fallback_preserves_page_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = pdf(None)?;
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(temp.path(), &bytes)?;
+        let service = DocumentService::new(Default::default())?;
+        let fallback: Arc<dyn ScannedPdfFallback> = Arc::new(FakeFallback);
+        let document = service
+            .parse_with_fallback(
+                "w",
+                "scan.pdf",
+                temp.path(),
+                &bytes,
+                Some(fallback.as_ref()),
+                &CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(document.status, DocumentStatus::Ready);
+        assert_eq!(
+            document.metadata.pipeline_fingerprint.as_deref(),
+            Some("vision:test:144dpi:v1")
+        );
+        let chunk = document.chunks.first().ok_or("missing vision chunk")?;
+        assert_eq!(chunk.page, Some(1));
+        assert_eq!(chunk.extraction_method, ExtractionMethod::Vision);
+        assert_eq!(chunk.confidence, ExtractionConfidence::High);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_limit_and_cancellation_are_explicit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = pdf(None)?;
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(temp.path(), &bytes)?;
+        let service = DocumentService::new(Default::default())?;
+        let limited = service
+            .parse_with_fallback(
+                "w",
+                "scan.pdf",
+                temp.path(),
+                &bytes,
+                Some(&LimitedFallback),
+                &CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(limited.status, DocumentStatus::Failed);
+        assert!(limited.metadata.warnings[0].contains("page limit"));
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = service
+            .parse_with_fallback(
+                "w",
+                "scan.pdf",
+                temp.path(),
+                &bytes,
+                Some(&FakeFallback),
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(cancelled, Err(DocumentError::Parse(message)) if message.contains("cancelled"))
+        );
+        Ok(())
     }
 }

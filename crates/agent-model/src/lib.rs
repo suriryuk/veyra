@@ -5,6 +5,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -208,6 +209,76 @@ pub enum ModelError {
     MalformedStream(String),
     #[error("malformed tool arguments for {tool}: {detail}")]
     MalformedToolArguments { tool: String, detail: String },
+    #[error("model router returned malformed data: {0}")]
+    MalformedRouter(String),
+    #[error("model is not configured for route {0}")]
+    RouteUnavailable(String),
+    #[error("model {model} did not become ready within {seconds} seconds")]
+    LoadTimeout { model: String, seconds: u64 },
+    #[error("model {model} does not support required modality {modality}")]
+    Capability { model: String, modality: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ModelId(pub String);
+
+impl ModelId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProfile {
+    Default,
+    Large,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRoute {
+    Default,
+    Large,
+    Vision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ModelCapabilities {
+    pub text: bool,
+    pub image: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutedModelStatus {
+    pub route: ModelRoute,
+    pub model: Option<ModelId>,
+    pub status: String,
+    pub capabilities: ModelCapabilities,
+    pub failed: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelFleetHealth {
+    pub available: bool,
+    pub routes: Vec<RoutedModelStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelRoutes {
+    pub default: ModelId,
+    pub large: ModelId,
+    pub vision: Option<ModelId>,
+}
+
+#[async_trait]
+pub trait ModelManager: Send + Sync {
+    async fn health(&self) -> Result<ModelFleetHealth, ModelError>;
+    async fn switch_model(&self, model: &ModelId) -> Result<(), ModelError>;
+    async fn switch_profile(&self, profile: ModelProfile) -> Result<ModelId, ModelError>;
+    fn model_for(&self, route: ModelRoute) -> Option<ModelId>;
 }
 
 impl ModelError {
@@ -482,6 +553,233 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 }
 
+#[derive(Clone)]
+pub struct RouterModelManager {
+    client: Client,
+    base_url: Url,
+    routes: ModelRoutes,
+    load_timeout: Duration,
+    current_profile: Arc<RwLock<ModelProfile>>,
+}
+
+impl RouterModelManager {
+    pub fn new(
+        base_url: &str,
+        routes: ModelRoutes,
+        request_timeout: Duration,
+        load_timeout: Duration,
+    ) -> Result<Self, ModelError> {
+        let base_url =
+            Url::parse(base_url).map_err(|error| ModelError::InvalidUrl(error.to_string()))?;
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(request_timeout)
+            .build()
+            .map_err(|error| ModelError::Transport(error.to_string()))?;
+        Ok(Self {
+            client,
+            base_url,
+            routes,
+            load_timeout,
+            current_profile: Arc::new(RwLock::new(ModelProfile::Default)),
+        })
+    }
+
+    fn router_endpoint(&self, path: &str) -> Url {
+        let mut url = self.base_url.clone();
+        url.set_path(path);
+        url.set_query(None);
+        url
+    }
+
+    pub fn provider(
+        &self,
+        route: ModelRoute,
+        request_timeout: Duration,
+    ) -> Result<OpenAiCompatibleProvider, ModelError> {
+        let model = self
+            .model_for(route)
+            .ok_or_else(|| ModelError::RouteUnavailable(format!("{route:?}").to_lowercase()))?;
+        OpenAiCompatibleProvider::new(self.base_url.as_str(), model.0, request_timeout)
+    }
+
+    async fn raw_models(&self) -> Result<Vec<Value>, ModelError> {
+        let response = self
+            .client
+            .get(self.router_endpoint("/models"))
+            .send()
+            .await
+            .map_err(|error| ModelError::Transport(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| ModelError::Transport(error.to_string()))?;
+        if !status.is_success() {
+            return Err(ModelError::Http {
+                status: status.as_u16(),
+                body: truncate(&body, 4096),
+            });
+        }
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|error| ModelError::MalformedRouter(error.to_string()))?;
+        value
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| ModelError::MalformedRouter("missing models.data array".to_owned()))
+    }
+
+    fn status_for(
+        route: ModelRoute,
+        model: Option<ModelId>,
+        entries: &[Value],
+    ) -> RoutedModelStatus {
+        let Some(model) = model else {
+            return RoutedModelStatus {
+                route,
+                model: None,
+                status: "unconfigured".to_owned(),
+                capabilities: ModelCapabilities::default(),
+                failed: false,
+                detail: None,
+            };
+        };
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(model.as_str()))
+        else {
+            return RoutedModelStatus {
+                route,
+                model: Some(model),
+                status: "missing".to_owned(),
+                capabilities: ModelCapabilities::default(),
+                failed: true,
+                detail: Some("model is not present in the router catalog".to_owned()),
+            };
+        };
+        let status = entry["status"]["value"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
+        let modalities = entry["architecture"]["input_modalities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let has = |wanted: &str| {
+            modalities
+                .iter()
+                .any(|value| value.as_str() == Some(wanted))
+        };
+        RoutedModelStatus {
+            route,
+            model: Some(model),
+            status,
+            capabilities: ModelCapabilities {
+                text: has("text"),
+                image: has("image"),
+            },
+            failed: entry["status"]["failed"].as_bool().unwrap_or(false),
+            detail: entry["status"]["exit_code"]
+                .as_i64()
+                .map(|code| format!("router child exited with code {code}")),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelManager for RouterModelManager {
+    async fn health(&self) -> Result<ModelFleetHealth, ModelError> {
+        let entries = self.raw_models().await?;
+        let routes = [ModelRoute::Default, ModelRoute::Large, ModelRoute::Vision]
+            .into_iter()
+            .map(|route| Self::status_for(route, self.model_for(route), &entries))
+            .collect::<Vec<_>>();
+        Ok(ModelFleetHealth {
+            available: routes
+                .iter()
+                .any(|route| !route.failed && route.model.is_some()),
+            routes,
+        })
+    }
+
+    async fn switch_model(&self, model: &ModelId) -> Result<(), ModelError> {
+        let entries = self.raw_models().await?;
+        let current = Self::status_for(ModelRoute::Default, Some(model.clone()), &entries);
+        if current.status == "missing" {
+            return Err(ModelError::RouteUnavailable(model.0.clone()));
+        }
+        if !current.failed && matches!(current.status.as_str(), "loaded" | "sleeping") {
+            return Ok(());
+        }
+        let response = self
+            .client
+            .post(self.router_endpoint("/models/load"))
+            .json(&serde_json::json!({"model":model.as_str()}))
+            .send()
+            .await
+            .map_err(|error| ModelError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_else(|_| status.to_string());
+            if status.as_u16() == 400 && body.contains("model is already running") {
+                return Ok(());
+            }
+            return Err(ModelError::Http {
+                status: status.as_u16(),
+                body: truncate(&body, 4096),
+            });
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let entries = self.raw_models().await?;
+            let status = Self::status_for(ModelRoute::Default, Some(model.clone()), &entries);
+            if status.failed {
+                return Err(ModelError::Transport(
+                    status
+                        .detail
+                        .unwrap_or_else(|| format!("model {} failed to load", model.0)),
+                ));
+            }
+            if matches!(status.status.as_str(), "loaded" | "sleeping") {
+                return Ok(());
+            }
+            if started.elapsed() >= self.load_timeout {
+                return Err(ModelError::LoadTimeout {
+                    model: model.0.clone(),
+                    seconds: self.load_timeout.as_secs(),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn switch_profile(&self, profile: ModelProfile) -> Result<ModelId, ModelError> {
+        let route = match profile {
+            ModelProfile::Default => ModelRoute::Default,
+            ModelProfile::Large => ModelRoute::Large,
+        };
+        let model = self
+            .model_for(route)
+            .ok_or_else(|| ModelError::RouteUnavailable(format!("{route:?}").to_lowercase()))?;
+        self.switch_model(&model).await?;
+        let mut current = self
+            .current_profile
+            .write()
+            .map_err(|_| ModelError::Transport("model profile lock poisoned".to_owned()))?;
+        *current = profile;
+        Ok(model)
+    }
+
+    fn model_for(&self, route: ModelRoute) -> Option<ModelId> {
+        match route {
+            ModelRoute::Default => Some(self.routes.default.clone()),
+            ModelRoute::Large => Some(self.routes.large.clone()),
+            ModelRoute::Vision => self.routes.vision.clone(),
+        }
+    }
+}
+
 async fn http_error(response: reqwest::Response) -> Result<ModelResponse, ModelError> {
     let status = response.status();
     let body = response.text().await.unwrap_or_else(|_| status.to_string());
@@ -620,6 +918,155 @@ mod tests {
         );
         assert_eq!(response.tool_calls[0].arguments["path"], "a.rs");
         assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn router_manager_loads_and_reports_route_capabilities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = vec![0_u8; 8192];
+                let read = socket.read(&mut request).await?;
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if index == 1 {
+                    assert!(request.starts_with("POST /models/load"));
+                    assert!(request.contains("\"model\":\"vision\""));
+                    "{\"success\":true}".to_owned()
+                } else {
+                    assert!(request.starts_with("GET /models"));
+                    let status = if index == 0 { "unloaded" } else { "loaded" };
+                    format!(
+                        "{{\"data\":[{{\"id\":\"coding\",\"status\":{{\"value\":\"unloaded\"}},\"architecture\":{{\"input_modalities\":[\"text\"]}}}},{{\"id\":\"vision\",\"status\":{{\"value\":\"{status}\"}},\"architecture\":{{\"input_modalities\":[\"text\",\"image\"]}}}}]}}"
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let manager = RouterModelManager::new(
+            &format!("http://{address}/v1"),
+            ModelRoutes {
+                default: ModelId("coding".to_owned()),
+                large: ModelId("coding".to_owned()),
+                vision: Some(ModelId("vision".to_owned())),
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )?;
+        manager.switch_model(&ModelId("vision".to_owned())).await?;
+        let health = manager.health().await?;
+        server.await??;
+        let vision = health
+            .routes
+            .iter()
+            .find(|route| route.route == ModelRoute::Vision)
+            .ok_or("missing vision route")?;
+        assert_eq!(vision.status, "loaded");
+        assert!(vision.capabilities.image);
+        assert_eq!(
+            manager.model_for(ModelRoute::Large).map(|id| id.0),
+            Some("coding".to_owned())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn router_health_reports_missing_and_child_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = vec![0_u8; 8192];
+            let read = socket.read(&mut request).await?;
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /models"));
+            let body = r#"{"data":[{"id":"vision","status":{"value":"unloaded","failed":true,"exit_code":137},"architecture":{"input_modalities":["text","image"]}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let manager = RouterModelManager::new(
+            &format!("http://{address}/v1"),
+            ModelRoutes {
+                default: ModelId("missing".to_owned()),
+                large: ModelId("missing".to_owned()),
+                vision: Some(ModelId("vision".to_owned())),
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )?;
+        let health = manager.health().await?;
+        server.await??;
+        assert!(!health.available);
+        assert_eq!(health.routes[0].status, "missing");
+        let vision = &health.routes[2];
+        assert!(vision.failed);
+        assert_eq!(
+            vision.detail.as_deref(),
+            Some("router child exited with code 137")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn router_load_timeout_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = vec![0_u8; 8192];
+                let read = socket.read(&mut request).await?;
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if index == 1 {
+                    assert!(request.starts_with("POST /models/load"));
+                    r#"{"success":true}"#
+                } else {
+                    assert!(request.starts_with("GET /models"));
+                    if index == 0 {
+                        r#"{"data":[{"id":"vision","status":{"value":"unloaded"},"architecture":{"input_modalities":["text","image"]}}]}"#
+                    } else {
+                        r#"{"data":[{"id":"vision","status":{"value":"loading"},"architecture":{"input_modalities":["text","image"]}}]}"#
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let manager = RouterModelManager::new(
+            &format!("http://{address}/v1"),
+            ModelRoutes {
+                default: ModelId("coding".to_owned()),
+                large: ModelId("coding".to_owned()),
+                vision: Some(ModelId("vision".to_owned())),
+            },
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )?;
+        let error = match manager.switch_model(&ModelId("vision".to_owned())).await {
+            Ok(()) => return Err("loading unexpectedly completed".into()),
+            Err(error) => error,
+        };
+        server.await??;
+        assert!(matches!(error, ModelError::LoadTimeout { .. }));
         Ok(())
     }
 }

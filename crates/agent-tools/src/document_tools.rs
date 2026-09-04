@@ -1,6 +1,7 @@
 use crate::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 use agent_document::{
-    DocumentRepository, DocumentSearchQuery, DocumentService, collect_supported_paths,
+    DocumentRepository, DocumentSearchQuery, DocumentService, ScannedPdfFallback,
+    collect_supported_paths,
 };
 use agent_model::ToolDefinition;
 use agent_security::RiskLevel;
@@ -14,10 +15,12 @@ pub fn register_document_tools(
     registry: &mut ToolRegistry,
     repository: Arc<dyn DocumentRepository>,
     service: DocumentService,
+    fallback: Option<Arc<dyn ScannedPdfFallback>>,
 ) -> Result<(), ToolError> {
     registry.register(DocumentIndex {
         repository: repository.clone(),
         service: service.clone(),
+        fallback,
     })?;
     registry.register(DocumentList {
         repository: repository.clone(),
@@ -31,6 +34,7 @@ pub fn register_document_tools(
 struct DocumentIndex {
     repository: Arc<dyn DocumentRepository>,
     service: DocumentService,
+    fallback: Option<Arc<dyn ScannedPdfFallback>>,
 }
 struct DocumentList {
     repository: Arc<dyn DocumentRepository>,
@@ -108,6 +112,7 @@ impl Tool for DocumentIndex {
         )
         .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         let mut results = Vec::new();
+        let mut audit_documents = Vec::new();
         for path in paths {
             if context.cancellation.is_cancelled() {
                 return Err(ToolError::Cancelled);
@@ -123,12 +128,29 @@ impl Tool for DocumentIndex {
                 .map_err(|e| ToolError::Io(e.to_string()))?;
             let document = self
                 .service
-                .parse(
+                .parse_with_fallback(
                     &context.workspace.root().display().to_string(),
                     &relative,
+                    &resolved,
                     &bytes,
+                    self.fallback.as_deref(),
+                    &context.cancellation,
                 )
+                .await
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
+            let vision_pages = document
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.extraction_method == agent_document::ExtractionMethod::Vision)
+                .filter_map(|chunk| chunk.page)
+                .collect::<std::collections::BTreeSet<_>>();
+            audit_documents.push(json!({
+                "path": relative,
+                "status": document.status,
+                "pipeline_fingerprint": document.metadata.pipeline_fingerprint,
+                "vision_pages_succeeded": vision_pages,
+                "page_failures_or_limits": document.metadata.warnings,
+            }));
             results.push(
                 self.repository
                     .upsert(&document)
@@ -141,7 +163,13 @@ impl Tool for DocumentIndex {
             content: json!({"kind":"document_index","documents":results}),
             summary: format!("indexed {count} documents"),
             truncated: false,
-            metadata: json!({"kind":"document_index","document_count":count}),
+            metadata: json!({
+                "kind":"document_index",
+                "document_count":count,
+                "vision_route":"vision",
+                "pdf_rendering":"pdftoppm",
+                "documents":audit_documents,
+            }),
         })
     }
 }

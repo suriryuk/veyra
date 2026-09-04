@@ -1,4 +1,4 @@
-use agent_context::ContextProfile;
+use agent_context::{ContextProfile, ContextProfileName};
 use agent_core::{
     AgentError, AgentEvent, AgentEventSink, AgentLimits, AgentRunner, AgentRunnerConfig, AgentState,
 };
@@ -8,7 +8,10 @@ use agent_document::{
 };
 use agent_mcp::{McpConfig, McpManager};
 use agent_model::Message;
-use agent_model::{ModelProvider, OpenAiCompatibleProvider, SamplingConfig};
+use agent_model::{
+    ModelId, ModelManager, ModelProfile, ModelProvider, ModelRoute, ModelRoutes,
+    RouterModelManager, SamplingConfig,
+};
 use agent_research::{FetchPolicy, HttpFetcher, SearxngProvider};
 use agent_security::{
     ApprovalDecision, ApprovalProvider, ApprovalRequest, CompositeAuditSink, JsonlAuditSink,
@@ -17,7 +20,10 @@ use agent_security::{
 use agent_storage::SqliteSessionRepository;
 use agent_tools::{
     CommandLimits, CommandProfiles, ExecutionLimits, ToolRegistry, register_builtin_tools,
-    register_document_tools, register_research_tools,
+    register_document_tools, register_research_tools, register_vision_tool,
+};
+use agent_vision::{
+    OpenAiVisionProvider, PopplerRenderer, VisionLimits, VisionPdfFallback, VisionService,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -75,11 +81,25 @@ enum Commands {
         #[command(subcommand)]
         command: DocumentCommand,
     },
+    Vision {
+        #[command(subcommand)]
+        command: VisionCommand,
+    },
 }
 
 #[derive(Subcommand)]
 enum ModelCommand {
     Status,
+}
+#[derive(Subcommand)]
+enum VisionCommand {
+    Analyze {
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 #[derive(Subcommand)]
 enum ToolCommand {
@@ -191,6 +211,8 @@ enum CliError {
     Security(#[from] agent_security::SecurityError),
     #[error("model setup failed: {0}")]
     Model(#[from] agent_model::ModelError),
+    #[error("vision failed: {0}")]
+    Vision(#[from] agent_vision::VisionError),
     #[error("agent failed: {0}")]
     Agent(#[from] agent_core::AgentError),
     #[error("storage failed: {0}")]
@@ -206,6 +228,7 @@ struct AppConfig {
     model: ModelSection,
     context: Option<ContextSection>,
     documents: DocumentLimits,
+    vision: VisionLimits,
     research: ResearchSection,
     mcp: McpConfig,
     security: SecuritySection,
@@ -244,6 +267,15 @@ struct ModelSection {
     context_size: usize,
     request_timeout_seconds: u64,
     sampling: SamplingSection,
+    routes: ModelRoutesSection,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ModelRoutesSection {
+    default: Option<String>,
+    large: Option<String>,
+    vision: Option<String>,
+    load_timeout_seconds: u64,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -332,6 +364,17 @@ impl Default for ModelSection {
             context_size: 32768,
             request_timeout_seconds: 300,
             sampling: SamplingSection::default(),
+            routes: ModelRoutesSection::default(),
+        }
+    }
+}
+impl Default for ModelRoutesSection {
+    fn default() -> Self {
+        Self {
+            default: None,
+            large: None,
+            vision: None,
+            load_timeout_seconds: 300,
         }
     }
 }
@@ -403,6 +446,9 @@ impl AppConfig {
         if let Ok(value) = env::var("VEYRA_MODEL_NAME") {
             config.model.model = value;
         }
+        if let Ok(value) = env::var("VEYRA_VISION_MODEL_NAME") {
+            config.model.routes.vision = Some(value);
+        }
         if let Ok(value) = env::var("VEYRA_WORKSPACE_ROOT") {
             config.security.workspace_root = PathBuf::from(value);
         }
@@ -427,7 +473,10 @@ impl AppConfig {
         {
             return Err(CliError::Config("agent limits must be positive".to_owned()));
         }
-        if self.model.request_timeout_seconds == 0 || self.tools.command_timeout_seconds == 0 {
+        if self.model.request_timeout_seconds == 0
+            || self.model.routes.load_timeout_seconds == 0
+            || self.tools.command_timeout_seconds == 0
+        {
             return Err(CliError::Config("timeouts must be positive".to_owned()));
         }
         if self.research.request_timeout_seconds == 0
@@ -443,6 +492,23 @@ impl AppConfig {
         self.documents
             .validate()
             .map_err(|error| CliError::Config(error.to_string()))?;
+        self.vision
+            .validate()
+            .map_err(|error| CliError::Config(error.to_string()))?;
+        for route in [
+            self.model.routes.default.as_deref(),
+            self.model.routes.large.as_deref(),
+            self.model.routes.vision.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if route.trim().is_empty() {
+                return Err(CliError::Config(
+                    "model route names must not be empty".to_owned(),
+                ));
+            }
+        }
         SearxngProvider::new(
             &self.research.searxng_base_url,
             Duration::from_secs(self.research.request_timeout_seconds),
@@ -717,7 +783,8 @@ async fn main() -> Result<(), CliError> {
             tokio::fs::create_dir_all(&config.security.workspace_root).await?;
             let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
             let database = Arc::new(storage(&config).await?);
-            let (registry, manager) = registry(&config, &workspace, database).await?;
+            let router = model_manager(&config)?;
+            let (registry, manager) = registry(&config, &workspace, database, router).await?;
             for definition in registry.definitions() {
                 println!(
                     "{}\t{}",
@@ -730,9 +797,24 @@ async fn main() -> Result<(), CliError> {
         Commands::Models {
             command: ModelCommand::Status,
         } => {
-            let provider = provider(&config)?;
-            let health = provider.health().await?;
-            println!("available={} {}", health.available, health.detail);
+            let manager = model_manager(&config)?;
+            let health = manager.health().await?;
+            println!("available={}", health.available);
+            for route in health.routes {
+                println!(
+                    "{:?}\tmodel={}\tstatus={}\ttext={}\timage={}\tfailed={}{}",
+                    route.route,
+                    route.model.as_ref().map_or("-", ModelId::as_str),
+                    route.status,
+                    route.capabilities.text,
+                    route.capabilities.image,
+                    route.failed,
+                    route
+                        .detail
+                        .map(|value| format!("\tdetail={value}"))
+                        .unwrap_or_default(),
+                );
+            }
             Ok(())
         }
         Commands::Run { task } => {
@@ -750,6 +832,7 @@ async fn main() -> Result<(), CliError> {
         Commands::Chat => chat(&config, &selected_context).await,
         Commands::Sessions { command } => sessions(&config, &selected_context, command).await,
         Commands::Documents { command } => documents(&config, command).await,
+        Commands::Vision { command } => vision(&config, command).await,
     }
 }
 
@@ -764,7 +847,7 @@ async fn chat_session(
     mut history: Vec<Message>,
 ) -> Result<(), CliError> {
     println!(
-        "Veyra v0.7 — session {}; context profile {}; enter a task, or /quit to exit.",
+        "Veyra v0.8 — session {}; context profile {}; enter a task, or /quit to exit.",
         session_id,
         context.name.as_str(),
     );
@@ -858,9 +941,19 @@ async fn runner(
 ) -> Result<RunnerBundle, CliError> {
     tokio::fs::create_dir_all(&config.security.workspace_root).await?;
     let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
-    let provider = Arc::new(provider(config)?);
+    let manager = model_manager(config)?;
+    let (profile, route) = if context.name == ContextProfileName::Large {
+        (ModelProfile::Large, ModelRoute::Large)
+    } else {
+        (ModelProfile::Default, ModelRoute::Default)
+    };
+    manager.switch_profile(profile).await?;
+    let provider = Arc::new(manager.provider(
+        route,
+        Duration::from_secs(config.model.request_timeout_seconds),
+    )?);
     provider.health().await?;
-    let (registry, mcp) = registry(config, &workspace, database.clone()).await?;
+    let (registry, mcp) = registry(config, &workspace, database.clone(), manager).await?;
     let registry = Arc::new(registry);
     let jsonl = Arc::new(JsonlAuditSink::open(config.logging.directory.join("audit.jsonl")).await?);
     let audit_sinks: Vec<Arc<dyn agent_security::AuditSink>> = vec![database.clone(), jsonl];
@@ -924,6 +1017,9 @@ async fn documents(config: &AppConfig, command: DocumentCommand) -> Result<(), C
     let repository = storage(config).await?;
     let service = DocumentService::new(config.documents.clone())
         .map_err(|e| CliError::Config(e.to_string()))?;
+    let vision = vision_services(config, model_manager(config)?)?;
+    let fallback = vision.as_ref().map(|bundle| bundle.fallback.as_ref());
+    let cancellation = CancellationToken::new();
     match command {
         DocumentCommand::Add { paths, json } => {
             if paths.is_empty() {
@@ -949,9 +1045,17 @@ async fn documents(config: &AppConfig, command: DocumentCommand) -> Result<(), C
                     .map_err(|e| CliError::Storage(e.to_string()))?
                     .to_string_lossy()
                     .replace('\\', "/");
-                let bytes = tokio::fs::read(resolved).await?;
+                let bytes = tokio::fs::read(&resolved).await?;
                 let document = service
-                    .parse(&workspace_key, &relative, &bytes)
+                    .parse_with_fallback(
+                        &workspace_key,
+                        &relative,
+                        &resolved,
+                        &bytes,
+                        fallback,
+                        &cancellation,
+                    )
+                    .await
                     .map_err(|e| CliError::Storage(e.to_string()))?;
                 results.push(
                     repository
@@ -1075,6 +1179,53 @@ async fn documents(config: &AppConfig, command: DocumentCommand) -> Result<(), C
                     println!("{:.4}\t{}\n{}", value.score, value.citation, value.excerpt)
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+async fn vision(config: &AppConfig, command: VisionCommand) -> Result<(), CliError> {
+    let VisionCommand::Analyze {
+        paths,
+        prompt,
+        json,
+    } = command;
+    if paths.is_empty() {
+        return Err(CliError::Config(
+            "at least one image path is required".to_owned(),
+        ));
+    }
+    let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
+    let bundle = vision_services(config, model_manager(config)?)?
+        .ok_or_else(|| CliError::Config("model.routes.vision is not configured".to_owned()))?;
+    let mut resolved_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let resolved = workspace.resolve_existing(&path)?;
+        let relative = resolved
+            .strip_prefix(workspace.root())
+            .map_err(|error| CliError::Config(error.to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        resolved_paths.push((relative, resolved));
+    }
+    let result = bundle
+        .service
+        .analyze_paths(&resolved_paths, &prompt, &CancellationToken::new())
+        .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .map_err(|error| CliError::Config(error.to_string()))?
+        );
+    } else {
+        println!("{}", result.text);
+        println!("confidence: {:?}", result.confidence);
+        for source in result.sources {
+            println!("source: {}", source.citation);
+        }
+        for limitation in result.limitations {
+            println!("limitation: {limitation}");
         }
     }
     Ok(())
@@ -1291,6 +1442,7 @@ async fn registry(
     config: &AppConfig,
     workspace: &WorkspaceGuard,
     database: Arc<SqliteSessionRepository>,
+    manager: Arc<RouterModelManager>,
 ) -> Result<(ToolRegistry, McpManager), CliError> {
     let mut value = ToolRegistry::new();
     register_builtin_tools(&mut value)?;
@@ -1313,7 +1465,12 @@ async fn registry(
     register_research_tools(&mut value, provider, fetcher, config.research.max_results)?;
     let document_service = DocumentService::new(config.documents.clone())
         .map_err(|error| CliError::Config(error.to_string()))?;
-    register_document_tools(&mut value, database, document_service)?;
+    let vision = vision_services(config, manager)?;
+    let fallback = vision.as_ref().map(|bundle| bundle.fallback.clone());
+    register_document_tools(&mut value, database, document_service, fallback)?;
+    if let Some(vision) = vision {
+        register_vision_tool(&mut value, vision.service)?;
+    }
     let connected = McpManager::connect_enabled(&config.mcp, workspace).await?;
     for diagnostic in &connected.diagnostics {
         eprintln!("[mcp:{}] {}", diagnostic.server, diagnostic.message);
@@ -1327,12 +1484,58 @@ async fn registry(
     Ok((value, connected.manager))
 }
 
-fn provider(config: &AppConfig) -> Result<OpenAiCompatibleProvider, agent_model::ModelError> {
-    OpenAiCompatibleProvider::new(
+fn model_manager(config: &AppConfig) -> Result<Arc<RouterModelManager>, agent_model::ModelError> {
+    let default = config
+        .model
+        .routes
+        .default
+        .clone()
+        .unwrap_or_else(|| config.model.model.clone());
+    let large = config
+        .model
+        .routes
+        .large
+        .clone()
+        .unwrap_or_else(|| default.clone());
+    Ok(Arc::new(RouterModelManager::new(
         &config.model.base_url,
-        &config.model.model,
+        ModelRoutes {
+            default: ModelId(default),
+            large: ModelId(large),
+            vision: config.model.routes.vision.clone().map(ModelId),
+        },
         Duration::from_secs(config.model.request_timeout_seconds),
-    )
+        Duration::from_secs(config.model.routes.load_timeout_seconds),
+    )?))
+}
+
+struct VisionServices {
+    service: Arc<VisionService>,
+    fallback: Arc<dyn agent_document::ScannedPdfFallback>,
+}
+
+fn vision_services(
+    config: &AppConfig,
+    manager: Arc<RouterModelManager>,
+) -> Result<Option<VisionServices>, CliError> {
+    let Some(model) = manager.model_for(ModelRoute::Vision) else {
+        return Ok(None);
+    };
+    let provider = Arc::new(OpenAiVisionProvider::new(
+        &config.model.base_url,
+        manager,
+        Duration::from_secs(config.model.request_timeout_seconds),
+        config.vision.max_output_chars,
+    )?);
+    let service = Arc::new(VisionService::new(config.vision.clone(), provider.clone())?);
+    let renderer = Arc::new(PopplerRenderer::new(config.vision.clone())?);
+    let fallback = Arc::new(VisionPdfFallback::new(
+        renderer,
+        provider,
+        config.vision.clone(),
+        model.as_str(),
+    ));
+    Ok(Some(VisionServices { service, fallback }))
 }
 
 fn init_logging(config: &AppConfig) -> Result<WorkerGuard, CliError> {
@@ -1428,7 +1631,9 @@ mod tests {
                 .await
                 .map_err(CliError::Storage)?,
         );
-        let (registry, manager) = registry(&AppConfig::default(), &workspace, database).await?;
+        let config = AppConfig::default();
+        let router = model_manager(&config)?;
+        let (registry, manager) = registry(&config, &workspace, database, router).await?;
         let definitions = registry.definitions();
         assert!(
             definitions

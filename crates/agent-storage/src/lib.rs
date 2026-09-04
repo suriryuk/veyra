@@ -2,8 +2,8 @@ use agent_context::MemorySnippet;
 use agent_core::{AgentEvent, AgentState, AgentStatus, Observation, SessionRepository};
 use agent_document::{
     DocumentChunk, DocumentError, DocumentFormat, DocumentRepository, DocumentSearchHit,
-    DocumentSearchQuery, DocumentSource, DocumentStatus, DocumentSummary, IndexResult,
-    NormalizedDocument, term_frequencies, tokenize,
+    DocumentSearchQuery, DocumentSource, DocumentStatus, DocumentSummary, ExtractionConfidence,
+    ExtractionMethod, IndexResult, NormalizedDocument, term_frequencies, tokenize,
 };
 use agent_model::Message;
 use agent_security::{
@@ -148,6 +148,12 @@ CREATE TABLE IF NOT EXISTS document_terms (
 CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace, indexed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_document_terms_term ON document_terms(term, chunk_id);
+"#;
+
+const MIGRATION_3: &str = r#"
+ALTER TABLE document_chunks ADD COLUMN extraction_method TEXT NOT NULL DEFAULT 'text';
+ALTER TABLE document_chunks ADD COLUMN confidence TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE document_chunks ADD COLUMN limitations_json TEXT NOT NULL DEFAULT '[]';
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,6 +401,16 @@ fn migrate(path: &Path) -> Result<(), String> {
     let transaction = connection.transaction().map_err(display)?;
     transaction.execute_batch(MIGRATION_1).map_err(display)?;
     transaction.execute_batch(MIGRATION_2).map_err(display)?;
+    let has_v3: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=3)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display)?;
+    if !has_v3 {
+        transaction.execute_batch(MIGRATION_3).map_err(display)?;
+    }
     transaction
         .execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?1)",
@@ -404,6 +420,12 @@ fn migrate(path: &Path) -> Result<(), String> {
     transaction
         .execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?1)",
+            [Utc::now().to_rfc3339()],
+        )
+        .map_err(display)?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?1)",
             [Utc::now().to_rfc3339()],
         )
         .map_err(display)?;
@@ -936,9 +958,20 @@ fn enum_name<T: Serialize>(value: &T) -> Result<String, String> {
 
 fn upsert_document(path: &Path, document: &NormalizedDocument) -> Result<IndexResult, String> {
     let mut connection = connect(path)?;
-    let unchanged: bool=connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM documents WHERE workspace=?1 AND path=?2 AND content_hash=?3 AND status=?4)",
-        params![document.workspace,document.source.path,document.source.content_hash,enum_name(&document.status)?], |row| row.get(0)).map_err(display)?;
+    let existing: Option<(String, String, String)> = connection.query_row(
+        "SELECT content_hash,status,metadata_json FROM documents WHERE workspace=?1 AND path=?2",
+        params![document.workspace,document.source.path],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(display)?;
+    let expected_status = enum_name(&document.status)?;
+    let unchanged = existing.is_some_and(|(hash, status, metadata)| {
+        let fingerprint = serde_json::from_str::<agent_document::DocumentMetadata>(&metadata)
+            .ok()
+            .and_then(|value| value.pipeline_fingerprint);
+        hash == document.source.content_hash
+            && status == expected_status
+            && fingerprint == document.metadata.pipeline_fingerprint
+    });
     if unchanged {
         let summary = list_documents(path, &document.workspace, None, usize::MAX)?
             .into_iter()
@@ -962,8 +995,8 @@ fn upsert_document(path: &Path, document: &NormalizedDocument) -> Result<IndexRe
         enum_name(&document.status)?,document.error,serde_json::to_string(&document.metadata).map_err(display)?,document.text,
         i64_value(document.metadata.byte_size),i64_value(document.chunks.len()),now]).map_err(display)?;
     for chunk in &document.chunks {
-        transaction.execute("INSERT INTO document_chunks(id,document_id,ordinal,text,page,heading,start_offset,end_offset,token_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![chunk.id,document.id,i64_value(chunk.ordinal),chunk.text,chunk.page.map(i64::from),chunk.heading,i64_value(chunk.start_offset),i64_value(chunk.end_offset),i64_value(chunk.token_count)]).map_err(display)?;
+        transaction.execute("INSERT INTO document_chunks(id,document_id,ordinal,text,page,heading,start_offset,end_offset,token_count,extraction_method,confidence,limitations_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![chunk.id,document.id,i64_value(chunk.ordinal),chunk.text,chunk.page.map(i64::from),chunk.heading,i64_value(chunk.start_offset),i64_value(chunk.end_offset),i64_value(chunk.token_count),enum_name(&chunk.extraction_method)?,enum_name(&chunk.confidence)?,serde_json::to_string(&chunk.limitations).map_err(display)?]).map_err(display)?;
         for (term, frequency) in term_frequencies(&chunk.text) {
             transaction
                 .execute(
@@ -1049,7 +1082,7 @@ fn get_document(
         return Ok(None);
     };
     let chunks = if include_chunks {
-        let mut statement=connection.prepare("SELECT id,ordinal,text,page,heading,start_offset,end_offset,token_count FROM document_chunks WHERE document_id=?1 ORDER BY ordinal").map_err(display)?;
+        let mut statement=connection.prepare("SELECT id,ordinal,text,page,heading,start_offset,end_offset,token_count,extraction_method,confidence,limitations_json FROM document_chunks WHERE document_id=?1 ORDER BY ordinal").map_err(display)?;
         statement
             .query_map([id], |row| {
                 Ok(DocumentChunk {
@@ -1064,6 +1097,10 @@ fn get_document(
                     start_offset: usize_value(row.get(5)?),
                     end_offset: usize_value(row.get(6)?),
                     token_count: usize_value(row.get(7)?),
+                    extraction_method: parse_enum_value(row.get::<_, String>(8)?)?,
+                    confidence: parse_enum_value(row.get::<_, String>(9)?)?,
+                    limitations: serde_json::from_str(&row.get::<_, String>(10)?)
+                        .unwrap_or_default(),
                 })
             })
             .map_err(display)?
@@ -1099,7 +1136,7 @@ fn search_documents(
     }
     let filters = query.document_ids.iter().cloned().collect::<HashSet<_>>();
     let connection = connect(path)?;
-    let mut statement=connection.prepare("SELECT c.id,c.document_id,c.ordinal,c.text,c.page,c.heading,c.start_offset,c.end_offset,c.token_count,d.path FROM document_chunks c JOIN documents d ON d.id=c.document_id WHERE d.workspace=?1 AND d.status IN ('ready','partial')").map_err(display)?;
+    let mut statement=connection.prepare("SELECT c.id,c.document_id,c.ordinal,c.text,c.page,c.heading,c.start_offset,c.end_offset,c.token_count,d.path,c.extraction_method,c.confidence,c.limitations_json FROM document_chunks c JOIN documents d ON d.id=c.document_id WHERE d.workspace=?1 AND d.status IN ('ready','partial')").map_err(display)?;
     #[derive(Clone)]
     struct Row {
         cid: String,
@@ -1113,6 +1150,9 @@ fn search_documents(
         len: usize,
         path: String,
         tf: HashMap<String, usize>,
+        extraction_method: ExtractionMethod,
+        confidence: ExtractionConfidence,
+        limitations: Vec<String>,
     }
     let rows = statement
         .query_map([&query.workspace], |row| {
@@ -1131,6 +1171,9 @@ fn search_documents(
                 end: usize_value(row.get(7)?),
                 len: usize_value(row.get(8)?),
                 path: row.get(9)?,
+                extraction_method: parse_enum_value(row.get::<_, String>(10)?)?,
+                confidence: parse_enum_value(row.get::<_, String>(11)?)?,
+                limitations: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
             })
         })
         .map_err(display)?
@@ -1194,6 +1237,9 @@ fn search_documents(
                 score,
                 excerpt: truncate(&r.text, 500),
                 citation,
+                extraction_method: r.extraction_method,
+                confidence: r.confidence,
+                limitations: r.limitations,
             })
         })
         .collect::<Vec<_>>();
@@ -1210,6 +1256,12 @@ fn search_documents(
 
 fn parse_enum<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T, String> {
     serde_json::from_str(&format!("\"{value}\"")).map_err(display)
+}
+
+fn parse_enum_value<T: for<'de> Deserialize<'de>>(value: String) -> rusqlite::Result<T> {
+    serde_json::from_str(&format!("\"{value}\"")).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
 }
 fn usize_value(value: i64) -> usize {
     usize::try_from(value).unwrap_or(0)
@@ -1294,7 +1346,7 @@ mod tests {
             [],
             |row| row.get::<_, i64>(0),
         )?;
-        assert_eq!(versions, 2);
+        assert_eq!(versions, 3);
         Ok(())
     }
 

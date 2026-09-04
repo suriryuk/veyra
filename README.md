@@ -1,4 +1,4 @@
-# Veyra v0.7
+# Veyra v0.8
 
 Veyra is a safe local coding-agent runtime written in Rust. It connects to an
 OpenAI-compatible `llama-server`, streams model output, inspects a configured
@@ -7,16 +7,17 @@ and reviews the final Git diff before completing a changed task. A bounded Conte
 Manager retrieves relevant source ranges and durable workspace memories while
 keeping every model request within an explicit 32K or 65K profile. SQLite-backed
 sessions preserve task, plan, message, Tool, approval, event, and audit history.
-Veyra v0.7 adds persistent analysis of PDF, DOCX, HTML, Markdown, and TXT files.
-Documents are normalized into source-addressable chunks and searched with bounded
-keyword/BM25 retrieval without placing whole documents in model context.
+Veyra v0.8 adds router-managed coding/vision model selection, bounded local image
+analysis, and page-level Vision fallback for scanned and mixed PDFs. Documents remain
+source-addressable and searchable without placing whole files in model context.
 
 ## Requirements
 
 - Windows 11 with WSL2 Ubuntu 24.04 (reference environment), or Linux
 - Rust 1.88.0; `rust-toolchain.toml` installs rustfmt and clippy
 - Git, Cargo, and preferably ripgrep for coding and automatic retrieval
-- A running OpenAI-compatible server for interactive use
+- Poppler `pdftoppm` for scanned-PDF fallback
+- A running llama.cpp router for interactive coding/vision use
 - Node.js 18 or newer only when the Playwright MCP server is enabled
 
 The repository uses Cargo's Rust-version fallback resolver and commits
@@ -36,32 +37,22 @@ and a temporary Rust fixture. Downloading a model is not required.
 
 ## Start llama-server
 
-From WSL2, start the configured Qwen3-Coder model:
+From WSL2, start llama.cpp in router mode. `--models-max 1` keeps at most one model
+loaded, which is the reference policy for a 16 GB GPU:
 
 ```bash
 ./llama-server \
-  -m ./models/Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
-  --host 127.0.0.1 --port 8080 --ctx-size 32768 \
-  --n-gpu-layers 999 --flash-attn on \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --batch-size 2048 --ubatch-size 512 --parallel 1
+  --models-preset ./config/llama-models.ini \
+  --models-max 1 \
+  --host 127.0.0.1 --port 8080
 ```
 
 Check connectivity with `cargo run -p agent-cli -- models status`.
 
-For an explicitly selected large-context run, restart the server with the matching
-context and KV cache profile:
-
-```bash
-./llama-server \
-  -m ./models/Qwen3-Coder-30B-A3B-Instruct-UD-Q3_K_XL.gguf \
-  --host 127.0.0.1 --port 8080 --ctx-size 65536 \
-  --n-gpu-layers 999 --flash-attn on \
-  --cache-type-k q4_0 --cache-type-v q4_0 \
-  --batch-size 2048 --ubatch-size 512 --parallel 1
-```
-
-Veyra selects request budgets but does not restart or reconfigure `llama-server`.
+The preset defines `coding-default`, `coding-large`, and `vision` aliases. Veyra calls
+the router's `/models` and `/models/load` endpoints and waits for readiness, but never
+starts, stops, or owns the router process. Existing single-model `[model].model`
+configuration remains a compatible default/large fallback.
 
 ## Configuration
 
@@ -79,6 +70,12 @@ max_identical_failures = 3
 [context]
 profile = "default"
 
+[model.routes]
+default = "coding-default"
+large = "coding-large"
+vision = "vision"
+load_timeout_seconds = 300
+
 [storage]
 database_path = "data/veyra.sqlite3"
 
@@ -92,13 +89,24 @@ chunk_overlap_chars = 200
 default_search_limit = 10
 max_search_limit = 50
 
+[vision]
+max_file_bytes = 10485760
+max_images_per_request = 8
+max_pixels_per_image = 16000000
+max_total_pixels = 32000000
+max_pdf_pages = 50
+pdf_dpi = 144
+render_timeout_seconds = 120
+max_output_chars = 65536
+pdftoppm_command = "pdftoppm"
+
 [research]
 searxng_base_url = "http://127.0.0.1:8888/"
 request_timeout_seconds = 20
 max_redirects = 5
 max_response_bytes = 2097152
 max_results = 10
-user_agent = "Veyra/0.7"
+user_agent = "Veyra/0.8"
 
 [mcp]
 connect_timeout_seconds = 30
@@ -130,7 +138,7 @@ timeout_seconds = 60
 Each profile can set `timeout_seconds`, `stdout_limit_bytes`, and
 `stderr_limit_bytes`. A Tool request may lower but never raise its configured
 timeout. Existing v0.1 configuration files remain valid. Supported environment
-overrides are `VEYRA_MODEL_BASE_URL`, `VEYRA_MODEL_NAME`,
+overrides are `VEYRA_MODEL_BASE_URL`, `VEYRA_MODEL_NAME`, `VEYRA_VISION_MODEL_NAME`,
 `VEYRA_WORKSPACE_ROOT`, `VEYRA_LOG_LEVEL`, and `VEYRA_SEARXNG_BASE_URL`.
 
 The built-in `default` profile uses a 32,768-token context with a 2,048-token
@@ -153,6 +161,8 @@ veyra documents add docs/spec.pdf notes.md
 veyra documents list --json
 veyra documents show <document-id> --chunks
 veyra documents search "security requirements" --limit 10
+veyra vision analyze screenshots/error.png --prompt "오류 원인을 설명해 줘"
+veyra vision analyze architecture.png diagram.webp --prompt "구성 요소를 비교해 줘" --json
 veyra models status
 veyra tools list
 veyra config check
@@ -168,6 +178,23 @@ actual server usage, and overflow-retry events are shown on stderr. The global
 The bundled system prompt requires all assistant prose, including progress and final
 answers, to remain in Korean while preserving code, commands, URLs, identifiers, and
 verbatim errors where translation would reduce accuracy.
+
+## v0.8 Vision and scanned PDFs
+
+`vision analyze` and the read-only `vision_analyze` Agent Tool accept workspace-local
+PNG, JPEG, and WebP files. Each result includes exact source citations, the loaded
+model ID, extracted content, `high`/`medium`/`low`/`unknown` confidence, and limitations.
+Paths are canonicalized through the workspace guard; symlink escape, remote URLs,
+MIME/extension mismatch, corrupt files, more than 8 inputs, files over 10 MiB, images
+over 16 MP, or requests over 32 MP are rejected rather than resized silently.
+
+PDF parsing still tries the text layer first, page by page. Only pages with fewer than
+20 alphanumeric characters are rendered by `pdftoppm` at 144 DPI and sent sequentially
+to Vision, up to 50 pages. Successful pages survive individual failures; mixed results
+are `partial`, total failure is `failed`, and an absent/unavailable Vision route retains
+the legacy `unsupported_scanned` behavior. Chunks persist extraction method, confidence,
+and limitations. Reuse requires both the file hash and a model/rendering pipeline
+fingerprint to match. Vision output is an untrusted observation, never an instruction.
 
 ## v0.7 document analysis
 
@@ -188,10 +215,10 @@ receives valid labels to copy verbatim instead of regenerating the same uncited 
 For an explicit document-analysis task, Core rejects `read_file` calls and directs
 the model back to `document_list`, `document_index`, and `document_search`.
 
-Text PDFs are extracted page by page. PDFs with fewer than 20 extracted alphanumeric
-characters are marked `unsupported_scanned`; encrypted PDFs are marked separately.
-Scanned PDF OCR/Vision, images, embeddings, vector search, exact layout restoration,
-and document editing remain later-version work. DOCX archive expansion and all input,
+Text PDFs are extracted page by page; encrypted PDFs are marked separately. When the
+v0.8 Vision route is unavailable, scanned PDFs retain `unsupported_scanned` for backward
+compatibility. Embeddings, vector search, exact layout restoration, and document editing
+remain later-version work. DOCX archive expansion and all input,
 chunk, collection, and result sizes are bounded by `[documents]`.
 
 ## v0.6 MCP and browser
@@ -428,27 +455,28 @@ redacted from arguments and summaries.
 - `agent-context`: token budgets, retrieval, trimming, observation compression
 - `agent-research`: SearXNG search, SSRF-resistant fetch, source DTOs, extraction
 - `agent-document`: format parsers, normalization, chunking, and retrieval contracts
+- `agent-vision`: validated image DTOs, OpenAI multipart adapter, and Poppler fallback
 - `agent-mcp`: stdio lifecycle, discovery, Tool adapter, result and browser policy
 - `agent-storage`: SQLite migrations, session snapshots, memory and audit queries
-- `agent-model`: provider contract and OpenAI-compatible SSE adapter
+- `agent-model`: provider contract, router manager, capabilities, and SSE adapter
 - `agent-tools`: workspace, Git, Cargo, command, output, and process-tree adapters
 - `agent-security`: workspace guard, risk/approval, redaction, JSONL audit
 - `agent-cli`: configuration, composition root, rendering, approval prompt
 
 Web/TUI, remote/HTTP MCP transports, Browser GUI/takeover, credential automation,
-background crawling, scanned-document vision, remote Git operations, `Allow Always`,
-embeddings, vector databases, semantic reranking, and long-term memory retrieval
+background crawling, image generation/editing, video/audio, cloud Vision fallback,
+professional OCR/layout restoration, remote Git operations, `Allow Always`, embeddings,
+vector databases, semantic reranking, and long-term memory retrieval
 remain out of scope.
 
 ## Verification status
 
-Veyra v0.7.0 has 99 passing automated tests covering document normalization, UTF-8 offsets,
-UTF-16 input, migration v2, idempotent indexing, BM25 ranking, workspace isolation,
-and document-intent completion rules, while retaining prior MCP naming, risk override,
-schema rejection, bounded result, timeout/cancellation, startup isolation, browser
-path confinement, denial replay suppression, and citation gates. The workspace build,
-format, strict Clippy, and test gates pass under WSL2 Ubuntu 24.04 with Rust 1.88.0.
-The prior live SearXNG and Playwright smoke results remain valid.
+Veyra v0.8.0 has 110 passing automated tests covering router contracts, Vision image
+validation and multipart serialization, scanned-PDF provenance, migration v3, and
+Vision completion gates while retaining the v0.1-v0.7 regression suite. The workspace
+build, format, strict Clippy, and test gates pass under WSL2 Ubuntu 24.04 with Rust
+1.88.0. RTX 5080 16 GB에서 공식 Qwen3-VL image/scanned-PDF, coding route 복귀,
+VRAM 압박 및 child-failure 격리 smoke도 확인했다. 상세 결과는 local v0.8 release note에 있다.
 
-See [`docs/releases/v0.7.0.md`](docs/releases/v0.7.0.md) for release details. The
+See [`docs/releases/v0.8.0.md`](docs/releases/v0.8.0.md) for release details. The
 `docs/` directory is intentionally local and Git-ignored.

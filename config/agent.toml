@@ -16,6 +16,12 @@ top_p = 0.8
 top_k = 20
 repeat_penalty = 1.05
 
+[model.routes]
+default = "coding-default"
+large = "coding-large"
+vision = "vision"
+load_timeout_seconds = 300
+
 [context]
 profile = "default"
 
@@ -32,13 +38,24 @@ chunk_overlap_chars = 200
 default_search_limit = 10
 max_search_limit = 50
 
+[vision]
+max_file_bytes = 10485760
+max_images_per_request = 8
+max_pixels_per_image = 16000000
+max_total_pixels = 32000000
+max_pdf_pages = 50
+pdf_dpi = 144
+render_timeout_seconds = 120
+max_output_chars = 65536
+pdftoppm_command = "pdftoppm"
+
 [research]
 searxng_base_url = "http://127.0.0.1:8888/"
 request_timeout_seconds = 20
 max_redirects = 5
 max_response_bytes = 2097152
 max_results = 10
-user_agent = "Veyra/0.7"
+user_agent = "Veyra/0.8"
 
 [mcp]
 connect_timeout_seconds = 30

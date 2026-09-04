@@ -11,16 +11,18 @@ members = [
     "crates/agent-security",
     "crates/agent-storage",
     "crates/agent-tools",
+    "crates/agent-vision",
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -30,6 +32,7 @@ encoding_rs = "0.8"
 futures-util = "0.3"
 globset = "0.4"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 lopdf = "0.42"
 pdf-extract = "0.12"
 pulldown-cmark = "0.13"

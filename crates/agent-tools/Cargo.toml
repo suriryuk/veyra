@@ -10,6 +10,7 @@ agent-model = { path = "../agent-model" }
 agent-document = { path = "../agent-document" }
 agent-research = { path = "../agent-research" }
 agent-security = { path = "../agent-security" }
+agent-vision = { path = "../agent-vision" }
 async-trait.workspace = true
 diffy.workspace = true
 globset.workspace = true

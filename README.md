@@ -1,4 +1,4 @@
-# Veyra v0.6
+# Veyra v0.7
 
 Veyra is a safe local coding-agent runtime written in Rust. It connects to an
 OpenAI-compatible `llama-server`, streams model output, inspects a configured
@@ -7,9 +7,9 @@ and reviews the final Git diff before completing a changed task. A bounded Conte
 Manager retrieves relevant source ranges and durable workspace memories while
 keeping every model request within an explicit 32K or 65K profile. SQLite-backed
 sessions preserve task, plan, message, Tool, approval, event, and audit history.
-Veyra v0.6 adds opt-in stdio MCP servers and a headless Playwright workflow for
-dynamic pages. Discovered MCP Tools share the native Tool registry, approval,
-workspace confinement, result limits, and SQLite/JSONL audit path.
+Veyra v0.7 adds persistent analysis of PDF, DOCX, HTML, Markdown, and TXT files.
+Documents are normalized into source-addressable chunks and searched with bounded
+keyword/BM25 retrieval without placing whole documents in model context.
 
 ## Requirements
 
@@ -82,13 +82,23 @@ profile = "default"
 [storage]
 database_path = "data/veyra.sqlite3"
 
+[documents]
+max_file_bytes = 26214400
+max_uncompressed_bytes = 104857600
+max_documents_per_request = 100
+max_chunks_per_document = 10000
+chunk_target_chars = 2000
+chunk_overlap_chars = 200
+default_search_limit = 10
+max_search_limit = 50
+
 [research]
 searxng_base_url = "http://127.0.0.1:8888/"
 request_timeout_seconds = 20
 max_redirects = 5
 max_response_bytes = 2097152
 max_results = 10
-user_agent = "Veyra/0.6"
+user_agent = "Veyra/0.7"
 
 [mcp]
 connect_timeout_seconds = 30
@@ -139,6 +149,10 @@ veyra sessions show <session-id> --json --all
 veyra sessions show <session-id> --research
 veyra sessions resume <session-id>
 veyra sessions prune --older-than 90
+veyra documents add docs/spec.pdf notes.md
+veyra documents list --json
+veyra documents show <document-id> --chunks
+veyra documents search "security requirements" --limit 10
 veyra models status
 veyra tools list
 veyra config check
@@ -154,6 +168,31 @@ actual server usage, and overflow-retry events are shown on stderr. The global
 The bundled system prompt requires all assistant prose, including progress and final
 answers, to remain in Korean while preserving code, commands, URLs, identifiers, and
 verbatim errors where translation would reduce accuracy.
+
+## v0.7 document analysis
+
+`documents add` accepts workspace-relative files or directories. Directories are
+walked recursively for PDF, DOCX, HTML, Markdown, and TXT files. The persistent index
+is workspace-scoped; unchanged content hashes are reused and changed files are
+replaced atomically. `documents list/show/search` support human output and `--json`.
+
+The Agent exposes `document_index`, `document_list`, and `document_search`. Search
+results include a stable document ID, BM25 score, bounded excerpt, page when known,
+heading, UTF-8 byte offsets, and a citation label that must be reproduced in a
+document-analysis answer. A failure or unsupported input is recorded independently,
+so other documents remain searchable.
+
+Completion-gated answers are buffered until validation succeeds, so a rejected draft
+is not printed as if it were a final answer. If a citation is missing, the retry
+receives valid labels to copy verbatim instead of regenerating the same uncited text.
+For an explicit document-analysis task, Core rejects `read_file` calls and directs
+the model back to `document_list`, `document_index`, and `document_search`.
+
+Text PDFs are extracted page by page. PDFs with fewer than 20 extracted alphanumeric
+characters are marked `unsupported_scanned`; encrypted PDFs are marked separately.
+Scanned PDF OCR/Vision, images, embeddings, vector search, exact layout restoration,
+and document editing remain later-version work. DOCX archive expansion and all input,
+chunk, collection, and result sizes are bounded by `[documents]`.
 
 ## v0.6 MCP and browser
 
@@ -388,6 +427,7 @@ redacted from arguments and summaries.
 - `agent-core`: bounded loop, workflow evaluator, failure fingerprints, events
 - `agent-context`: token budgets, retrieval, trimming, observation compression
 - `agent-research`: SearXNG search, SSRF-resistant fetch, source DTOs, extraction
+- `agent-document`: format parsers, normalization, chunking, and retrieval contracts
 - `agent-mcp`: stdio lifecycle, discovery, Tool adapter, result and browser policy
 - `agent-storage`: SQLite migrations, session snapshots, memory and audit queries
 - `agent-model`: provider contract and OpenAI-compatible SSE adapter
@@ -396,22 +436,19 @@ redacted from arguments and summaries.
 - `agent-cli`: configuration, composition root, rendering, approval prompt
 
 Web/TUI, remote/HTTP MCP transports, Browser GUI/takeover, credential automation,
-background crawling, document/vision support, remote Git operations, `Allow Always`,
+background crawling, scanned-document vision, remote Git operations, `Allow Always`,
 embeddings, vector databases, semantic reranking, and long-term memory retrieval
 remain out of scope.
 
 ## Verification status
 
-Veyra v0.6.0 has 90 automated tests covering all prior contracts plus MCP naming,
-risk overrides, schema and argument rejection, bounded text/resource conversion,
-binary omission, timeout/cancellation, startup isolation, pre-call upload confinement,
-Playwright source/output-path metadata, denial replay suppression, negated search-intent handling, bounded completion rejection,
-and browser-backed research citation gates. The workspace
-build, format, strict Clippy, and test gates pass under WSL2 Ubuntu 24.04 with Rust
-1.88.0. With llama-server and the pinned Playwright MCP package, live headless smoke
-tests completed navigation, snapshot, approved click, denied form input without
-dispatch or repeated approval, workspace-confined download, and SQLite audit metadata
-inspection. The prior live SearXNG v0.5 smoke result also remains valid.
+Veyra v0.7.0 has 99 passing automated tests covering document normalization, UTF-8 offsets,
+UTF-16 input, migration v2, idempotent indexing, BM25 ranking, workspace isolation,
+and document-intent completion rules, while retaining prior MCP naming, risk override,
+schema rejection, bounded result, timeout/cancellation, startup isolation, browser
+path confinement, denial replay suppression, and citation gates. The workspace build,
+format, strict Clippy, and test gates pass under WSL2 Ubuntu 24.04 with Rust 1.88.0.
+The prior live SearXNG and Playwright smoke results remain valid.
 
-See [`docs/releases/v0.6.0.md`](docs/releases/v0.6.0.md) for release details. The
+See [`docs/releases/v0.7.0.md`](docs/releases/v0.7.0.md) for release details. The
 `docs/` directory is intentionally local and Git-ignored.

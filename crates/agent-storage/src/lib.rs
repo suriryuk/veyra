@@ -1,5 +1,10 @@
 use agent_context::MemorySnippet;
 use agent_core::{AgentEvent, AgentState, AgentStatus, Observation, SessionRepository};
+use agent_document::{
+    DocumentChunk, DocumentError, DocumentFormat, DocumentRepository, DocumentSearchHit,
+    DocumentSearchQuery, DocumentSource, DocumentStatus, DocumentSummary, IndexResult,
+    NormalizedDocument, term_frequencies, tokenize,
+};
 use agent_model::Message;
 use agent_security::{
     ApprovalDecision, AuditEvent, AuditSink, SecurityError, ToolCallId, redact_value,
@@ -9,7 +14,7 @@ use chrono::{Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -103,6 +108,46 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id, id);
+"#;
+
+const MIGRATION_2: &str = r#"
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT PRIMARY KEY,
+    workspace TEXT NOT NULL,
+    path TEXT NOT NULL,
+    format TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    title TEXT,
+    status TEXT NOT NULL,
+    error TEXT,
+    metadata_json TEXT NOT NULL,
+    normalized_text TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL,
+    indexed_at TEXT NOT NULL,
+    UNIQUE(workspace, path)
+);
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    page INTEGER,
+    heading TEXT,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    token_count INTEGER NOT NULL,
+    UNIQUE(document_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS document_terms (
+    chunk_id TEXT NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+    term TEXT NOT NULL,
+    frequency INTEGER NOT NULL,
+    PRIMARY KEY(chunk_id, term)
+);
+CREATE INDEX IF NOT EXISTS idx_documents_workspace ON documents(workspace, indexed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_document_terms_term ON document_terms(term, chunk_id);
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +249,58 @@ impl SqliteSessionRepository {
 }
 
 #[async_trait]
+impl DocumentRepository for SqliteSessionRepository {
+    async fn upsert(&self, document: &NormalizedDocument) -> Result<IndexResult, DocumentError> {
+        let path = self.path.clone();
+        let document = document.clone();
+        tokio::task::spawn_blocking(move || upsert_document(&path, &document))
+            .await
+            .map_err(|e| DocumentError::Storage(e.to_string()))?
+            .map_err(DocumentError::Storage)
+    }
+
+    async fn list(
+        &self,
+        workspace: &str,
+        status: Option<DocumentStatus>,
+        limit: usize,
+    ) -> Result<Vec<DocumentSummary>, DocumentError> {
+        let path = self.path.clone();
+        let workspace = workspace.to_owned();
+        tokio::task::spawn_blocking(move || list_documents(&path, &workspace, status, limit))
+            .await
+            .map_err(|e| DocumentError::Storage(e.to_string()))?
+            .map_err(DocumentError::Storage)
+    }
+
+    async fn get(
+        &self,
+        workspace: &str,
+        id: &str,
+        chunks: bool,
+    ) -> Result<Option<NormalizedDocument>, DocumentError> {
+        let path = self.path.clone();
+        let workspace = workspace.to_owned();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || get_document(&path, &workspace, &id, chunks))
+            .await
+            .map_err(|e| DocumentError::Storage(e.to_string()))?
+            .map_err(DocumentError::Storage)
+    }
+
+    async fn search(
+        &self,
+        query: DocumentSearchQuery,
+    ) -> Result<Vec<DocumentSearchHit>, DocumentError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || search_documents(&path, &query))
+            .await
+            .map_err(|e| DocumentError::Storage(e.to_string()))?
+            .map_err(DocumentError::Storage)
+    }
+}
+
+#[async_trait]
 impl SessionRepository for SqliteSessionRepository {
     async fn checkpoint(
         &self,
@@ -297,9 +394,16 @@ fn migrate(path: &Path) -> Result<(), String> {
     let mut connection = connect(path)?;
     let transaction = connection.transaction().map_err(display)?;
     transaction.execute_batch(MIGRATION_1).map_err(display)?;
+    transaction.execute_batch(MIGRATION_2).map_err(display)?;
     transaction
         .execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?1)",
+            [Utc::now().to_rfc3339()],
+        )
+        .map_err(display)?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?1)",
             [Utc::now().to_rfc3339()],
         )
         .map_err(display)?;
@@ -830,6 +934,287 @@ fn enum_name<T: Serialize>(value: &T) -> Result<String, String> {
         .map_err(display)
 }
 
+fn upsert_document(path: &Path, document: &NormalizedDocument) -> Result<IndexResult, String> {
+    let mut connection = connect(path)?;
+    let unchanged: bool=connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE workspace=?1 AND path=?2 AND content_hash=?3 AND status=?4)",
+        params![document.workspace,document.source.path,document.source.content_hash,enum_name(&document.status)?], |row| row.get(0)).map_err(display)?;
+    if unchanged {
+        let summary = list_documents(path, &document.workspace, None, usize::MAX)?
+            .into_iter()
+            .find(|d| d.id == document.id)
+            .ok_or_else(|| "unchanged document disappeared".to_owned())?;
+        return Ok(IndexResult {
+            document: summary,
+            unchanged: true,
+        });
+    }
+    let transaction = connection.transaction().map_err(display)?;
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "DELETE FROM documents WHERE workspace=?1 AND path=?2",
+            params![document.workspace, document.source.path],
+        )
+        .map_err(display)?;
+    transaction.execute("INSERT INTO documents(id,workspace,path,format,content_hash,title,status,error,metadata_json,normalized_text,byte_size,chunk_count,indexed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![document.id,document.workspace,document.source.path,enum_name(&document.source.format)?,document.source.content_hash,document.title,
+        enum_name(&document.status)?,document.error,serde_json::to_string(&document.metadata).map_err(display)?,document.text,
+        i64_value(document.metadata.byte_size),i64_value(document.chunks.len()),now]).map_err(display)?;
+    for chunk in &document.chunks {
+        transaction.execute("INSERT INTO document_chunks(id,document_id,ordinal,text,page,heading,start_offset,end_offset,token_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![chunk.id,document.id,i64_value(chunk.ordinal),chunk.text,chunk.page.map(i64::from),chunk.heading,i64_value(chunk.start_offset),i64_value(chunk.end_offset),i64_value(chunk.token_count)]).map_err(display)?;
+        for (term, frequency) in term_frequencies(&chunk.text) {
+            transaction
+                .execute(
+                    "INSERT INTO document_terms(chunk_id,term,frequency) VALUES(?1,?2,?3)",
+                    params![chunk.id, term, i64_value(frequency)],
+                )
+                .map_err(display)?;
+        }
+    }
+    transaction.commit().map_err(display)?;
+    Ok(IndexResult {
+        document: DocumentSummary {
+            id: document.id.clone(),
+            path: document.source.path.clone(),
+            format: document.source.format.clone(),
+            title: document.title.clone(),
+            status: document.status.clone(),
+            error: document.error.clone(),
+            byte_size: document.metadata.byte_size,
+            chunk_count: document.chunks.len(),
+            indexed_at: now,
+        },
+        unchanged: false,
+    })
+}
+
+fn list_documents(
+    path: &Path,
+    workspace: &str,
+    status: Option<DocumentStatus>,
+    limit: usize,
+) -> Result<Vec<DocumentSummary>, String> {
+    let connection = connect(path)?;
+    let status_name = status.as_ref().map(enum_name).transpose()?;
+    let mut statement=connection.prepare("SELECT id,path,format,title,status,error,byte_size,chunk_count,indexed_at FROM documents WHERE workspace=?1 AND (?2 IS NULL OR status=?2) ORDER BY indexed_at DESC,path ASC LIMIT ?3").map_err(display)?;
+    let rows = statement
+        .query_map(params![workspace, status_name, i64_value(limit)], |row| {
+            let found: DocumentStatus =
+                serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(4)?)).map_err(
+                    |e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    },
+                )?;
+            let format: DocumentFormat =
+                serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?)).map_err(
+                    |e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    },
+                )?;
+            Ok(DocumentSummary {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                format,
+                title: row.get(3)?,
+                status: found,
+                error: row.get(5)?,
+                byte_size: usize_value(row.get(6)?),
+                chunk_count: usize_value(row.get(7)?),
+                indexed_at: row.get(8)?,
+            })
+        })
+        .map_err(display)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(display)
+}
+
+fn get_document(
+    path: &Path,
+    workspace: &str,
+    id: &str,
+    include_chunks: bool,
+) -> Result<Option<NormalizedDocument>, String> {
+    let connection = connect(path)?;
+    let row=connection.query_row("SELECT path,format,content_hash,title,status,error,metadata_json,normalized_text FROM documents WHERE workspace=?1 AND id=?2",params![workspace,id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,String>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?))).optional().map_err(display)?;
+    let Some((source_path, format, status_hash, title, status, error, metadata, text)) = row else {
+        return Ok(None);
+    };
+    let chunks = if include_chunks {
+        let mut statement=connection.prepare("SELECT id,ordinal,text,page,heading,start_offset,end_offset,token_count FROM document_chunks WHERE document_id=?1 ORDER BY ordinal").map_err(display)?;
+        statement
+            .query_map([id], |row| {
+                Ok(DocumentChunk {
+                    id: row.get(0)?,
+                    document_id: id.to_owned(),
+                    ordinal: usize_value(row.get(1)?),
+                    text: row.get(2)?,
+                    page: row
+                        .get::<_, Option<i64>>(3)?
+                        .and_then(|v| u32::try_from(v).ok()),
+                    heading: row.get(4)?,
+                    start_offset: usize_value(row.get(5)?),
+                    end_offset: usize_value(row.get(6)?),
+                    token_count: usize_value(row.get(7)?),
+                })
+            })
+            .map_err(display)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(display)?
+    } else {
+        Vec::new()
+    };
+    Ok(Some(NormalizedDocument {
+        id: id.to_owned(),
+        workspace: workspace.to_owned(),
+        source: DocumentSource {
+            path: source_path,
+            format: parse_enum(&format)?,
+            content_hash: status_hash,
+        },
+        title,
+        metadata: serde_json::from_str(&metadata).map_err(display)?,
+        status: parse_enum(&status)?,
+        error,
+        text,
+        chunks,
+    }))
+}
+
+fn search_documents(
+    path: &Path,
+    query: &DocumentSearchQuery,
+) -> Result<Vec<DocumentSearchHit>, String> {
+    let terms = tokenize(&query.query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filters = query.document_ids.iter().cloned().collect::<HashSet<_>>();
+    let connection = connect(path)?;
+    let mut statement=connection.prepare("SELECT c.id,c.document_id,c.ordinal,c.text,c.page,c.heading,c.start_offset,c.end_offset,c.token_count,d.path FROM document_chunks c JOIN documents d ON d.id=c.document_id WHERE d.workspace=?1 AND d.status IN ('ready','partial')").map_err(display)?;
+    #[derive(Clone)]
+    struct Row {
+        cid: String,
+        did: String,
+        ord: usize,
+        text: String,
+        page: Option<u32>,
+        heading: Option<String>,
+        start: usize,
+        end: usize,
+        len: usize,
+        path: String,
+        tf: HashMap<String, usize>,
+    }
+    let rows = statement
+        .query_map([&query.workspace], |row| {
+            let text: String = row.get(3)?;
+            Ok(Row {
+                cid: row.get(0)?,
+                did: row.get(1)?,
+                ord: usize_value(row.get(2)?),
+                tf: term_frequencies(&text).into_iter().collect(),
+                text,
+                page: row
+                    .get::<_, Option<i64>>(4)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                heading: row.get(5)?,
+                start: usize_value(row.get(6)?),
+                end: usize_value(row.get(7)?),
+                len: usize_value(row.get(8)?),
+                path: row.get(9)?,
+            })
+        })
+        .map_err(display)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(display)?
+        .into_iter()
+        .filter(|r| filters.is_empty() || filters.contains(&r.did))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = rows.len() as f64;
+    let avgdl = rows.iter().map(|r| r.len).sum::<usize>() as f64 / n;
+    let mut df = HashMap::new();
+    for term in &terms {
+        df.insert(
+            term.clone(),
+            rows.iter().filter(|r| r.tf.contains_key(term)).count() as f64,
+        );
+    }
+    let query_lower = query.query.to_lowercase();
+    let mut hits = rows
+        .into_iter()
+        .filter_map(|r| {
+            let mut score = 0.0;
+            for term in &terms {
+                let tf = *r.tf.get(term).unwrap_or(&0) as f64;
+                if tf > 0.0 {
+                    let d = *df.get(term).unwrap_or(&0.0);
+                    let idf = ((n - d + 0.5) / (d + 0.5) + 1.0).ln();
+                    score += idf * (tf * 2.2)
+                        / (tf + 1.2 * (1.0 - 0.75 + 0.75 * r.len as f64 / avgdl.max(1.0)));
+                }
+            }
+            if r.text.to_lowercase().contains(&query_lower) {
+                score += 1.0
+            }
+            if score <= 0.0 {
+                return None;
+            }
+            let citation = format!(
+                "[{}{}{} @{}-{}]",
+                r.path,
+                r.page.map(|p| format!(" p.{p}")).unwrap_or_default(),
+                r.heading
+                    .as_ref()
+                    .map(|h| format!(" § {h}"))
+                    .unwrap_or_default(),
+                r.start,
+                r.end
+            );
+            Some(DocumentSearchHit {
+                document_id: r.did,
+                path: r.path,
+                chunk_id: r.cid,
+                ordinal: r.ord,
+                page: r.page,
+                heading: r.heading,
+                start_offset: r.start,
+                end_offset: r.end,
+                score,
+                excerpt: truncate(&r.text, 500),
+                citation,
+            })
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.page.cmp(&b.page))
+            .then_with(|| a.ordinal.cmp(&b.ordinal))
+    });
+    hits.truncate(query.limit);
+    Ok(hits)
+}
+
+fn parse_enum<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T, String> {
+    serde_json::from_str(&format!("\"{value}\"")).map_err(display)
+}
+fn usize_value(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(0)
+}
+
 fn terms(text: &str) -> BTreeSet<String> {
     text.to_lowercase()
         .split(|character: char| !character.is_alphanumeric() && character != '_')
@@ -857,6 +1242,61 @@ mod tests {
     use agent_security::{ApprovalRequest, AuditPhase, RiskLevel, SessionId, TaskId};
     use agent_tools::ToolResult;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn document_migration_upsert_and_bm25_search_are_workspace_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = SqliteSessionRepository::open(temp.path().join("documents.db")).await?;
+        let service = agent_document::DocumentService::new(Default::default())?;
+        let first = service.parse(
+            "workspace-a",
+            "guide.md",
+            "# Rust\nRust safety ownership ownership memory.".as_bytes(),
+        )?;
+        let second = service.parse(
+            "workspace-a",
+            "other.txt",
+            "Cooking recipe ingredients and oven.".as_bytes(),
+        )?;
+        assert!(!repository.upsert(&first).await?.unchanged);
+        assert!(repository.upsert(&first).await?.unchanged);
+        repository.upsert(&second).await?;
+        let hits = repository
+            .search(DocumentSearchQuery {
+                workspace: "workspace-a".into(),
+                query: "Rust ownership".into(),
+                document_ids: Vec::new(),
+                limit: 10,
+            })
+            .await?;
+        assert_eq!(
+            hits.first().map(|hit| hit.document_id.as_str()),
+            Some(first.id.as_str())
+        );
+        assert!(
+            hits.first()
+                .is_some_and(|hit| hit.citation.contains("guide.md"))
+        );
+        assert!(
+            repository
+                .search(DocumentSearchQuery {
+                    workspace: "workspace-b".into(),
+                    query: "Rust".into(),
+                    document_ids: Vec::new(),
+                    limit: 10
+                })
+                .await?
+                .is_empty()
+        );
+        let versions = connect(repository.path())?.query_row(
+            "SELECT COUNT(*) FROM schema_migrations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(versions, 2);
+        Ok(())
+    }
 
     fn state(workspace: &Path) -> AgentState {
         AgentState {

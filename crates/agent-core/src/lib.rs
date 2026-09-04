@@ -16,8 +16,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -386,7 +386,8 @@ impl AgentRunner {
             .map_err(|error| AgentError::Context(error.to_string()))?;
         let sources = retrieval.snippets;
         let retrieval_report = retrieval.report;
-        let memories = if task_requires_web_research(&state.task) {
+        let document_analysis = task_requires_document_analysis(&state.task);
+        let memories = if task_requires_web_research(&state.task) || document_analysis {
             Vec::new()
         } else if let Some(repository) = &self.sessions {
             repository
@@ -395,6 +396,14 @@ impl AgentRunner {
                 .map_err(AgentError::Persistence)?
         } else {
             Vec::new()
+        };
+        let effective_system_prompt = if document_analysis {
+            format!(
+                "{}\n\nCurrent-task routing requirement: this is an explicit document-analysis task. Ignore unrelated repository context and prior subject matter. Start with document_list, index the user-named workspace path with document_index so stale hashes are refreshed, and then use document_search for evidence. Do not call read_file for document contents, web_search, or http_fetch unless the user explicitly asks for web research. Copy returned citation labels verbatim into the final answer.",
+                self.system_prompt
+            )
+        } else {
+            self.system_prompt.clone()
         };
 
         loop {
@@ -413,10 +422,6 @@ impl AgentRunner {
                     .await;
             }
             state.iteration += 1;
-            let token_sink = ForwardTokens {
-                task_id,
-                sink: self.events.as_ref(),
-            };
             let tools = self.registry.definitions();
             let plan = state
                 .plan
@@ -424,11 +429,12 @@ impl AgentRunner {
                 .map(|step| format!("- [{:?}] {}", step.status, step.description))
                 .collect::<Vec<_>>();
             let mut overflow_retry = false;
-            let (response, context_report) = loop {
+            let (response, context_report, buffered_tokens) = loop {
+                let token_sink = BufferedTokens::default();
                 let built = self
                     .context
                     .build(ContextInput {
-                        system_prompt: &self.system_prompt,
+                        system_prompt: &effective_system_prompt,
                         task: &state.task,
                         plan: &plan,
                         history: &state.messages,
@@ -476,7 +482,8 @@ impl AgentRunner {
                     overflow_retry = true;
                     continue;
                 }
-                break (response, report);
+                let buffered_tokens = token_sink.take();
+                break (response, report, buffered_tokens);
             };
             let response = match response {
                 Ok(value) => {
@@ -526,7 +533,7 @@ impl AgentRunner {
                     .content
                     .unwrap_or_else(|| "Task completed without a textual response.".to_owned());
                 if let Some(requirement) = completion_requirement(&state, &answer) {
-                    let key = format!("workflow_completion:{requirement}");
+                    let key = format!("workflow_completion:{}", requirement.code);
                     let occurrences = state.failure_counts.entry(key).or_default();
                     *occurrences = occurrences.saturating_add(1);
                     let occurrences = *occurrences;
@@ -535,16 +542,20 @@ impl AgentRunner {
                             .fail(
                                 &mut state,
                                 AgentError::Limit(format!(
-                                    "identical completion requirement repeated {occurrences} times: {requirement}"
+                                    "identical completion requirement repeated {occurrences} times: {}",
+                                    requirement.guidance
                                 )),
                             )
                             .await;
                     }
                     state.messages.push(Message::system(format!(
-                        "Workflow evaluator rejected completion: {requirement}. Continue with the required verification or review before answering."
+                        "Workflow evaluator rejected completion: {} Continue with the required verification or review before answering. Do not repeat the rejected draft.",
+                        requirement.guidance
                     )));
                     continue;
                 }
+                self.emit_buffered_tokens(&state, task_id, &buffered_tokens)
+                    .await?;
                 if let Some(step) = state.plan.first_mut() {
                     step.status = StepStatus::Completed;
                 }
@@ -567,6 +578,8 @@ impl AgentRunner {
                 }
                 return Ok(state);
             }
+            self.emit_buffered_tokens(&state, task_id, &buffered_tokens)
+                .await?;
             for call in response.tool_calls {
                 if state.tool_calls >= self.limits.max_tool_calls {
                     return self
@@ -721,6 +734,41 @@ impl AgentRunner {
             false,
         )
         .await?;
+        if task_requires_document_analysis(&state.task) && call.name == "read_file" {
+            let error = "read_file is disabled for document-analysis tasks; use document_list, document_index, and document_search instead".to_owned();
+            self.audit(
+                state,
+                call_id,
+                &call.name,
+                &call.arguments,
+                risk,
+                AuditPhase::Failed,
+                None,
+                None,
+                Some(error.clone()),
+                None,
+                false,
+            )
+            .await?;
+            self.emit(
+                state,
+                AgentEvent::ToolFailed {
+                    call_id,
+                    error: error.clone(),
+                },
+            )
+            .await?;
+            let failure = self
+                .register_failure(state, FailureKind::PolicyViolation, &error)
+                .await;
+            return Ok(error_observation(
+                call_id,
+                &call.name,
+                error,
+                state.workflow_phase,
+                Some(failure),
+            ));
+        }
         if let Err(error) = validation.or(risk_result.map(|_| ())) {
             let kind = failure_kind_for_tool_error(&error);
             let error = error.to_string();
@@ -991,6 +1039,25 @@ impl AgentRunner {
         }
     }
 
+    async fn emit_buffered_tokens(
+        &self,
+        state: &AgentState,
+        task_id: TaskId,
+        text: &str,
+    ) -> Result<(), AgentError> {
+        if !text.is_empty() {
+            self.emit(
+                state,
+                AgentEvent::TokenDelta {
+                    task_id,
+                    text: text.to_owned(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn observation_from_result(
         &self,
         state: &mut AgentState,
@@ -1189,7 +1256,53 @@ impl AgentRunner {
     }
 }
 
-fn completion_requirement(state: &AgentState, answer: &str) -> Option<&'static str> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionRequirement {
+    code: &'static str,
+    guidance: String,
+}
+
+impl CompletionRequirement {
+    fn new(code: &'static str, guidance: impl Into<String>) -> Self {
+        Self {
+            code,
+            guidance: guidance.into(),
+        }
+    }
+}
+
+fn completion_requirement(state: &AgentState, answer: &str) -> Option<CompletionRequirement> {
+    let document_searches = state
+        .observations
+        .iter()
+        .filter(|observation| observation.tool_name == "document_search" && !observation.is_error)
+        .collect::<Vec<_>>();
+    if task_requires_document_analysis(&state.task) && document_searches.is_empty() {
+        return Some(CompletionRequirement::new(
+            "document_search_missing",
+            "the user requested document analysis, but no document_search succeeded.",
+        ));
+    }
+    let citations = document_searches
+        .iter()
+        .flat_map(|observation| observation.content["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["citation"].as_str())
+        .collect::<BTreeSet<_>>();
+    let document_cited = citations.iter().any(|citation| answer.contains(*citation));
+    if !document_searches.is_empty() && !document_cited {
+        let examples = citations.into_iter().take(8).collect::<Vec<_>>().join(", ");
+        let guidance = if examples.is_empty() {
+            "the final document analysis must cite a retrieved document chunk, but the successful searches returned no hits; refine the query and search again.".to_owned()
+        } else {
+            format!(
+                "the final document analysis must copy at least one retrieved citation label verbatim, including its offset. Valid labels include: {examples}."
+            )
+        };
+        return Some(CompletionRequirement::new(
+            "document_citation_missing",
+            guidance,
+        ));
+    }
     let searched = state
         .observations
         .iter()
@@ -1214,10 +1327,16 @@ fn completion_requirement(state: &AgentState, answer: &str) -> Option<&'static s
         cited |= answer.contains(url);
     }
     if task_requires_web_research(&state.task) && !searched {
-        return Some("the user explicitly requested web research, but no web_search succeeded");
+        return Some(CompletionRequirement::new(
+            "web_search_missing",
+            "the user explicitly requested web research, but no web_search succeeded.",
+        ));
     }
     if searched && !fetch_attempted {
-        return Some("web search results must be verified with http_fetch before answering");
+        return Some(CompletionRequirement::new(
+            "web_fetch_missing",
+            "web search results must be verified with http_fetch before answering.",
+        ));
     }
     let browser_snapshot = state.observations.iter().any(|observation| {
         !observation.is_error
@@ -1225,23 +1344,72 @@ fn completion_requirement(state: &AgentState, answer: &str) -> Option<&'static s
             && observation.tool_name.ends_with("browser_snapshot")
     });
     if task_requires_browser_interaction(&state.task) && !browser_snapshot {
-        return Some(
-            "the user explicitly requested browser interaction, but no browser snapshot succeeded",
-        );
+        return Some(CompletionRequirement::new(
+            "browser_snapshot_missing",
+            "the user explicitly requested browser interaction, but no browser snapshot succeeded.",
+        ));
     }
     if verified && !cited {
-        return Some("the final answer must cite at least one successfully verified final URL");
+        return Some(CompletionRequirement::new(
+            "web_citation_missing",
+            "the final answer must cite at least one successfully verified final URL.",
+        ));
     }
     if state.change_sequence == 0 {
         return None;
     }
     if state.last_successful_verification != Some(state.change_sequence) {
-        return Some("a successful post-change verification is missing");
+        return Some(CompletionRequirement::new(
+            "post_change_verification_missing",
+            "a successful post-change verification is missing.",
+        ));
     }
     if state.last_diff_review != Some(state.change_sequence) {
-        return Some("a post-change git_diff review is missing");
+        return Some(CompletionRequirement::new(
+            "post_change_diff_missing",
+            "a post-change git_diff review is missing.",
+        ));
     }
     None
+}
+
+fn task_requires_document_analysis(task: &str) -> bool {
+    let task = task.to_lowercase();
+    let implementation = [
+        "구현",
+        "수정",
+        "리팩터",
+        "코드",
+        "implement",
+        "implementation",
+        "fix",
+        "refactor",
+        "code",
+    ]
+    .iter()
+    .any(|marker| task.contains(marker));
+    if implementation {
+        return false;
+    }
+    let document = ["문서", "pdf", "docx", "markdown", ".md", ".txt", "document"]
+        .iter()
+        .any(|marker| task.contains(marker));
+    let analysis = [
+        "분석",
+        "검색",
+        "요약",
+        "비교",
+        "공통",
+        "충돌",
+        "analyze",
+        "search",
+        "summarize",
+        "compare",
+        "conflict",
+    ]
+    .iter()
+    .any(|marker| task.contains(marker));
+    document && analysis
 }
 
 fn task_requires_web_research(task: &str) -> bool {
@@ -1532,19 +1700,27 @@ fn error_observation(
     }
 }
 
-struct ForwardTokens<'a> {
-    task_id: TaskId,
-    sink: &'a dyn AgentEventSink,
+#[derive(Default)]
+struct BufferedTokens {
+    text: StdMutex<String>,
 }
+
+impl BufferedTokens {
+    fn take(&self) -> String {
+        match self.text.lock() {
+            Ok(mut text) => std::mem::take(&mut *text),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+}
+
 #[async_trait]
-impl ModelEventSink for ForwardTokens<'_> {
+impl ModelEventSink for BufferedTokens {
     async fn token(&self, text: &str) {
-        self.sink
-            .emit(AgentEvent::TokenDelta {
-                task_id: self.task_id,
-                text: text.to_owned(),
-            })
-            .await;
+        match self.text.lock() {
+            Ok(mut buffer) => buffer.push_str(text),
+            Err(poisoned) => poisoned.into_inner().push_str(text),
+        }
     }
 }
 
@@ -1627,6 +1803,23 @@ mod tests {
             Ok(ToolResult::text("changed".to_owned(), "changed", false))
         }
     }
+    struct ReadFileSpy(Arc<AtomicBool>);
+    #[async_trait]
+    impl Tool for ReadFileSpy {
+        fn definition(&self) -> agent_model::ToolDefinition {
+            agent_model::ToolDefinition::function("read_file", "spy", json!({"type":"object"}))
+        }
+        fn risk(&self, _: &Value) -> Result<RiskLevel, ToolError> {
+            Ok(RiskLevel::Read)
+        }
+        fn validate(&self, _: &Value) -> Result<(), ToolError> {
+            Ok(())
+        }
+        async fn execute(&self, _: &ToolContext, _: Value) -> Result<ToolResult, ToolError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(ToolResult::text("read".to_owned(), "read", false))
+        }
+    }
     struct WorkflowTool {
         name: &'static str,
         risk: RiskLevel,
@@ -1707,6 +1900,20 @@ mod tests {
     struct ContextEvents {
         built: AtomicUsize,
         usage: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct TokenEvents {
+        tokens: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentEventSink for TokenEvents {
+        async fn emit(&self, event: AgentEvent) {
+            if matches!(event, AgentEvent::TokenDelta { .. }) {
+                self.tokens.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     #[async_trait]
@@ -1975,6 +2182,15 @@ mod tests {
         assert!(!task_requires_browser_interaction(
             "브라우저 없이 정적 페이지를 확인해줘"
         ));
+        assert!(task_requires_document_analysis(
+            "PDF 5개를 분석해서 공통 내용과 충돌하는 주장을 비교해줘"
+        ));
+        assert!(task_requires_document_analysis(
+            "PDF 파일을 분석해서 요약해줘"
+        ));
+        assert!(!task_requires_document_analysis(
+            "PDF parser를 구현하고 테스트해줘"
+        ));
     }
 
     #[test]
@@ -2024,8 +2240,8 @@ mod tests {
             None
         );
         assert_eq!(
-            completion_requirement(&state, "확인했습니다."),
-            Some("the final answer must cite at least one successfully verified final URL")
+            completion_requirement(&state, "확인했습니다.").map(|requirement| requirement.code),
+            Some("web_citation_missing")
         );
 
         let mut browser_only = state.clone();
@@ -2037,11 +2253,30 @@ mod tests {
         );
         browser_only.observations.clear();
         assert_eq!(
-            completion_requirement(&browser_only, "완료했습니다."),
-            Some(
-                "the user explicitly requested browser interaction, but no browser snapshot succeeded"
-            )
+            completion_requirement(&browser_only, "완료했습니다.")
+                .map(|requirement| requirement.code),
+            Some("browser_snapshot_missing")
         );
+
+        let mut document_state = state.clone();
+        document_state.task = "PDF 문서를 분석하고 요약해줘".to_owned();
+        document_state.observations = vec![observation(
+            "document_search",
+            json!({"kind":"document_search","hits":[{"citation":"[guide.pdf p.2 @10-30]"}]}),
+            false,
+        )];
+        assert_eq!(
+            completion_requirement(&document_state, "근거 [guide.pdf p.2 @10-30]"),
+            None
+        );
+        let requirement = completion_requirement(&document_state, "근거 없는 요약");
+        assert_eq!(
+            requirement.as_ref().map(|requirement| requirement.code),
+            Some("document_citation_missing")
+        );
+        assert!(requirement.is_some_and(|requirement| {
+            requirement.guidance.contains("[guide.pdf p.2 @10-30]")
+        }));
     }
 
     #[tokio::test]
@@ -2057,12 +2292,13 @@ mod tests {
         let provider = FakeModel {
             responses: Mutex::new(vec![answer(), answer(), answer()]),
         };
+        let events = Arc::new(TokenEvents::default());
         let runner = AgentRunner::new(AgentRunnerConfig {
             provider: Arc::new(provider),
             registry: Arc::new(ToolRegistry::new()),
             approver: Arc::new(Allow),
             audit: Arc::new(Null),
-            events: Arc::new(Null),
+            events: events.clone(),
             workspace: WorkspaceGuard::new(temp.path())?,
             limits: AgentLimits {
                 max_iterations: 10,
@@ -2082,6 +2318,122 @@ mod tests {
             Err(AgentError::Limit(message))
                 if message.contains("identical completion requirement repeated 3 times")
         ));
+        assert_eq!(events.tokens.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_completion_flushes_buffered_tokens() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let events = Arc::new(TokenEvents::default());
+        let provider = FakeModel {
+            responses: Mutex::new(vec![ModelResponse {
+                content: Some("완료했습니다.".to_owned()),
+                tool_calls: Vec::new(),
+                usage: None,
+                finish_reason: FinishReason::Stop,
+            }]),
+        };
+        let runner = AgentRunner::new(AgentRunnerConfig {
+            provider: Arc::new(provider),
+            registry: Arc::new(ToolRegistry::new()),
+            approver: Arc::new(Allow),
+            audit: Arc::new(Null),
+            events: events.clone(),
+            workspace: WorkspaceGuard::new(temp.path())?,
+            limits: AgentLimits::default(),
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+            sessions: None,
+        });
+
+        runner.run("상태를 알려줘").await?;
+        assert_eq!(events.tokens.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn document_analysis_blocks_read_file_and_recovers_with_search()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let read_executed = Arc::new(AtomicBool::new(false));
+        let citation = "[manual/guide.txt @0-20]";
+        let mut registry = ToolRegistry::new();
+        registry.register(ReadFileSpy(read_executed.clone()))?;
+        registry.register(WorkflowTool {
+            name: "document_search",
+            risk: RiskLevel::Read,
+            results: Mutex::new(vec![ToolResult {
+                content: json!({
+                    "kind":"document_search",
+                    "query":"guide",
+                    "hits":[{"citation":citation}]
+                }),
+                summary: "document search returned 1 chunk".to_owned(),
+                truncated: false,
+                metadata: json!({"kind":"document_search","result_count":1}),
+            }]),
+        })?;
+        let provider = FakeModel {
+            responses: Mutex::new(vec![
+                ModelResponse {
+                    content: Some(format!("근거 {citation}")),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    finish_reason: FinishReason::Stop,
+                },
+                ModelResponse {
+                    content: None,
+                    tool_calls: vec![RequestedToolCall {
+                        id: "search".to_owned(),
+                        name: "document_search".to_owned(),
+                        arguments: json!({"query":"guide"}),
+                    }],
+                    usage: None,
+                    finish_reason: FinishReason::ToolCalls,
+                },
+                ModelResponse {
+                    content: None,
+                    tool_calls: vec![RequestedToolCall {
+                        id: "read".to_owned(),
+                        name: "read_file".to_owned(),
+                        arguments: json!({"path":"manual/guide.txt"}),
+                    }],
+                    usage: None,
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ]),
+        };
+        let runner = AgentRunner::new(AgentRunnerConfig {
+            provider: Arc::new(provider),
+            registry: Arc::new(registry),
+            approver: Arc::new(Allow),
+            audit: Arc::new(Null),
+            events: Arc::new(Null),
+            workspace: WorkspaceGuard::new(temp.path())?,
+            limits: AgentLimits::default(),
+            execution_limits: ExecutionLimits::default(),
+            sampling: SamplingConfig::default(),
+            context_profile: ContextProfile::default_32k(),
+            system_prompt: "system".to_owned(),
+            cancellation: CancellationToken::new(),
+            sessions: None,
+        });
+
+        let state = runner.run("manual의 문서 파일을 분석해서 요약해줘").await?;
+        assert!(!read_executed.load(Ordering::SeqCst));
+        assert_eq!(state.status, AgentStatus::Completed);
+        assert!(state.observations[0].is_error);
+        assert!(
+            state.observations[0]
+                .summary
+                .contains("read_file is disabled")
+        );
+        assert_eq!(state.observations[1].tool_name, "document_search");
         Ok(())
     }
 

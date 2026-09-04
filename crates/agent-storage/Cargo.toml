@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 agent-context = { path = "../agent-context" }
 agent-core = { path = "../agent-core" }
+agent-document = { path = "../agent-document" }
 agent-model = { path = "../agent-model" }
 agent-security = { path = "../agent-security" }
 async-trait.workspace = true

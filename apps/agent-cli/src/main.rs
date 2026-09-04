@@ -2,6 +2,10 @@ use agent_context::ContextProfile;
 use agent_core::{
     AgentError, AgentEvent, AgentEventSink, AgentLimits, AgentRunner, AgentRunnerConfig, AgentState,
 };
+use agent_document::{
+    DocumentLimits, DocumentRepository, DocumentSearchQuery, DocumentService, DocumentStatus,
+    collect_supported_paths,
+};
 use agent_mcp::{McpConfig, McpManager};
 use agent_model::Message;
 use agent_model::{ModelProvider, OpenAiCompatibleProvider, SamplingConfig};
@@ -13,7 +17,7 @@ use agent_security::{
 use agent_storage::SqliteSessionRepository;
 use agent_tools::{
     CommandLimits, CommandProfiles, ExecutionLimits, ToolRegistry, register_builtin_tools,
-    register_research_tools,
+    register_document_tools, register_research_tools,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -67,6 +71,10 @@ enum Commands {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Documents {
+        #[command(subcommand)]
+        command: DocumentCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -109,6 +117,61 @@ enum SessionCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum DocumentCommand {
+    Add {
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long, value_enum)]
+        status: Option<DocumentStatusArg>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        chunks: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Search {
+        query: String,
+        #[arg(long = "document")]
+        documents: Vec<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DocumentStatusArg {
+    Ready,
+    Partial,
+    UnsupportedFormat,
+    UnsupportedScanned,
+    UnsupportedEncrypted,
+    Failed,
+}
+impl From<DocumentStatusArg> for DocumentStatus {
+    fn from(value: DocumentStatusArg) -> Self {
+        match value {
+            DocumentStatusArg::Ready => Self::Ready,
+            DocumentStatusArg::Partial => Self::Partial,
+            DocumentStatusArg::UnsupportedFormat => Self::UnsupportedFormat,
+            DocumentStatusArg::UnsupportedScanned => Self::UnsupportedScanned,
+            DocumentStatusArg::UnsupportedEncrypted => Self::UnsupportedEncrypted,
+            DocumentStatusArg::Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ContextProfileArg {
@@ -142,6 +205,7 @@ struct AppConfig {
     agent: AgentSection,
     model: ModelSection,
     context: Option<ContextSection>,
+    documents: DocumentLimits,
     research: ResearchSection,
     mcp: McpConfig,
     security: SecuritySection,
@@ -256,7 +320,7 @@ impl Default for ResearchSection {
             max_redirects: 5,
             max_response_bytes: 2_097_152,
             max_results: 10,
-            user_agent: "Veyra/0.6".to_owned(),
+            user_agent: "Veyra/0.7".to_owned(),
         }
     }
 }
@@ -376,6 +440,9 @@ impl AppConfig {
                 "research limits and user agent must be non-empty and positive".to_owned(),
             ));
         }
+        self.documents
+            .validate()
+            .map_err(|error| CliError::Config(error.to_string()))?;
         SearxngProvider::new(
             &self.research.searxng_base_url,
             Duration::from_secs(self.research.request_timeout_seconds),
@@ -649,7 +716,8 @@ async fn main() -> Result<(), CliError> {
         } => {
             tokio::fs::create_dir_all(&config.security.workspace_root).await?;
             let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
-            let (registry, manager) = registry(&config, &workspace).await?;
+            let database = Arc::new(storage(&config).await?);
+            let (registry, manager) = registry(&config, &workspace, database).await?;
             for definition in registry.definitions() {
                 println!(
                     "{}\t{}",
@@ -681,6 +749,7 @@ async fn main() -> Result<(), CliError> {
         }
         Commands::Chat => chat(&config, &selected_context).await,
         Commands::Sessions { command } => sessions(&config, &selected_context, command).await,
+        Commands::Documents { command } => documents(&config, command).await,
     }
 }
 
@@ -695,7 +764,7 @@ async fn chat_session(
     mut history: Vec<Message>,
 ) -> Result<(), CliError> {
     println!(
-        "Veyra v0.6 — session {}; context profile {}; enter a task, or /quit to exit.",
+        "Veyra v0.7 — session {}; context profile {}; enter a task, or /quit to exit.",
         session_id,
         context.name.as_str(),
     );
@@ -791,7 +860,7 @@ async fn runner(
     let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
     let provider = Arc::new(provider(config)?);
     provider.health().await?;
-    let (registry, mcp) = registry(config, &workspace).await?;
+    let (registry, mcp) = registry(config, &workspace, database.clone()).await?;
     let registry = Arc::new(registry);
     let jsonl = Arc::new(JsonlAuditSink::open(config.logging.directory.join("audit.jsonl")).await?);
     let audit_sinks: Vec<Arc<dyn agent_security::AuditSink>> = vec![database.clone(), jsonl];
@@ -846,6 +915,169 @@ async fn storage(config: &AppConfig) -> Result<SqliteSessionRepository, CliError
     SqliteSessionRepository::open(&config.storage.database_path)
         .await
         .map_err(CliError::Storage)
+}
+
+async fn documents(config: &AppConfig, command: DocumentCommand) -> Result<(), CliError> {
+    tokio::fs::create_dir_all(&config.security.workspace_root).await?;
+    let workspace = WorkspaceGuard::new(&config.security.workspace_root)?;
+    let workspace_key = workspace.root().display().to_string();
+    let repository = storage(config).await?;
+    let service = DocumentService::new(config.documents.clone())
+        .map_err(|e| CliError::Config(e.to_string()))?;
+    match command {
+        DocumentCommand::Add { paths, json } => {
+            if paths.is_empty() {
+                return Err(CliError::Config(
+                    "at least one document path is required".into(),
+                ));
+            }
+            let safe_inputs = paths
+                .into_iter()
+                .map(|path| workspace.resolve_existing(path))
+                .collect::<Result<Vec<_>, _>>()?;
+            let paths = collect_supported_paths(
+                workspace.root(),
+                &safe_inputs,
+                service.limits().max_documents_per_request,
+            )
+            .map_err(|e| CliError::Storage(e.to_string()))?;
+            let mut results = Vec::new();
+            for path in paths {
+                let resolved = workspace.resolve_existing(path)?;
+                let relative = resolved
+                    .strip_prefix(workspace.root())
+                    .map_err(|e| CliError::Storage(e.to_string()))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let bytes = tokio::fs::read(resolved).await?;
+                let document = service
+                    .parse(&workspace_key, &relative, &bytes)
+                    .map_err(|e| CliError::Storage(e.to_string()))?;
+                results.push(
+                    repository
+                        .upsert(&document)
+                        .await
+                        .map_err(|e| CliError::Storage(e.to_string()))?,
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&results)
+                        .map_err(|e| CliError::Storage(e.to_string()))?
+                );
+            } else {
+                for result in results {
+                    println!(
+                        "{}\t{:?}\tchunks={}{}",
+                        result.document.path,
+                        result.document.status,
+                        result.document.chunk_count,
+                        if result.unchanged { "\tunchanged" } else { "" }
+                    );
+                }
+            }
+        }
+        DocumentCommand::List {
+            status,
+            limit,
+            json,
+        } => {
+            if limit == 0 {
+                return Err(CliError::Config("limit must be positive".into()));
+            }
+            let values = repository
+                .list(&workspace_key, status.map(Into::into), limit)
+                .await
+                .map_err(|e| CliError::Storage(e.to_string()))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&values)
+                        .map_err(|e| CliError::Storage(e.to_string()))?
+                )
+            } else {
+                for value in values {
+                    println!(
+                        "{}\t{}\t{:?}\tchunks={}",
+                        value.id, value.path, value.status, value.chunk_count
+                    )
+                }
+            }
+        }
+        DocumentCommand::Show { id, chunks, json } => {
+            let value = repository
+                .get(&workspace_key, &id, chunks)
+                .await
+                .map_err(|e| CliError::Storage(e.to_string()))?
+                .ok_or_else(|| CliError::Storage(format!("document not found: {id}")))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value)
+                        .map_err(|e| CliError::Storage(e.to_string()))?
+                )
+            } else {
+                println!(
+                    "{}\npath: {}\nstatus: {:?}\nchunks: {}",
+                    value.id,
+                    value.source.path,
+                    value.status,
+                    value.chunks.len()
+                );
+                if chunks {
+                    for chunk in value.chunks {
+                        println!(
+                            "\n{} page={:?} heading={:?} @{}-{}\n{}",
+                            chunk.id,
+                            chunk.page,
+                            chunk.heading,
+                            chunk.start_offset,
+                            chunk.end_offset,
+                            chunk.text
+                        )
+                    }
+                }
+            }
+        }
+        DocumentCommand::Search {
+            query,
+            documents,
+            limit,
+            json,
+        } => {
+            if query.trim().is_empty() {
+                return Err(CliError::Config("query must not be empty".into()));
+            }
+            let limit = limit.unwrap_or(service.limits().default_search_limit);
+            if limit == 0 || limit > service.limits().max_search_limit {
+                return Err(CliError::Config(
+                    "search limit is outside configured range".into(),
+                ));
+            }
+            let values = repository
+                .search(DocumentSearchQuery {
+                    workspace: workspace_key,
+                    query,
+                    document_ids: documents,
+                    limit,
+                })
+                .await
+                .map_err(|e| CliError::Storage(e.to_string()))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&values)
+                        .map_err(|e| CliError::Storage(e.to_string()))?
+                )
+            } else {
+                for value in values {
+                    println!("{:.4}\t{}\n{}", value.score, value.citation, value.excerpt)
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn sessions(
@@ -1058,6 +1290,7 @@ fn apply_command_overrides(
 async fn registry(
     config: &AppConfig,
     workspace: &WorkspaceGuard,
+    database: Arc<SqliteSessionRepository>,
 ) -> Result<(ToolRegistry, McpManager), CliError> {
     let mut value = ToolRegistry::new();
     register_builtin_tools(&mut value)?;
@@ -1078,6 +1311,9 @@ async fn registry(
     ))
     .map_err(|error| CliError::Config(error.to_string()))?;
     register_research_tools(&mut value, provider, fetcher, config.research.max_results)?;
+    let document_service = DocumentService::new(config.documents.clone())
+        .map_err(|error| CliError::Config(error.to_string()))?;
+    register_document_tools(&mut value, database, document_service)?;
     let connected = McpManager::connect_enabled(&config.mcp, workspace).await?;
     for diagnostic in &connected.diagnostics {
         eprintln!("[mcp:{}] {}", diagnostic.server, diagnostic.message);
@@ -1184,16 +1420,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_includes_research_tools() -> Result<(), CliError> {
+    async fn registry_includes_research_and_document_tools() -> Result<(), CliError> {
         let temp = tempfile::tempdir()?;
         let workspace = WorkspaceGuard::new(temp.path())?;
-        let (registry, manager) = registry(&AppConfig::default(), &workspace).await?;
+        let database = Arc::new(
+            SqliteSessionRepository::open(temp.path().join("test.db"))
+                .await
+                .map_err(CliError::Storage)?,
+        );
+        let (registry, manager) = registry(&AppConfig::default(), &workspace, database).await?;
         let definitions = registry.definitions();
         assert!(
             definitions
                 .iter()
                 .any(|definition| definition.function.name == "web_search")
         );
+        for name in ["document_index", "document_list", "document_search"] {
+            assert!(
+                definitions
+                    .iter()
+                    .any(|definition| definition.function.name == name)
+            );
+        }
         assert!(
             definitions
                 .iter()

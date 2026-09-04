@@ -10,6 +10,7 @@ name = "veyra"
 path = "src/main.rs"
 
 [dependencies]
+agent-document = { path = "../../crates/agent-document" }
 agent-context = { path = "../../crates/agent-context" }
 agent-core = { path = "../../crates/agent-core" }
 agent-mcp = { path = "../../crates/agent-mcp" }

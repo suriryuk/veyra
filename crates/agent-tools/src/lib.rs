@@ -1,5 +1,6 @@
 mod builtins;
 mod cargo_tools;
+mod document_tools;
 mod git_tools;
 mod process;
 mod web_tools;
@@ -15,6 +16,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 pub use builtins::register_builtin_tools;
+pub use document_tools::register_document_tools;
 pub use web_tools::register_research_tools;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

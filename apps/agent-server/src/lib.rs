@@ -107,6 +107,7 @@ pub struct SessionCreated {
 pub struct SendMessage {
     pub message: String,
     pub context_profile: Option<ContextProfileChoice>,
+    pub model: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct SearchDocuments {
@@ -172,6 +173,7 @@ pub fn router(
         .route("/audit", get(audit))
         .route("/workspace/tree", get(workspace_tree))
         .route("/workspace/file", get(workspace_file))
+        .route("/workspace/image", get(workspace_image))
         .route("/workspace/git/status", get(git_status))
         .route("/workspace/git/diff", get(git_diff))
         .route("/openapi.json", get(openapi))
@@ -263,7 +265,12 @@ async fn send_message(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let started = state
         .app
-        .start_task(parse_session(&id)?, input.message, input.context_profile)
+        .start_task_with_model(
+            parse_session(&id)?,
+            input.message,
+            input.context_profile,
+            input.model,
+        )
         .await?;
     Ok((StatusCode::ACCEPTED, Json(json!(started))))
 }
@@ -323,9 +330,17 @@ async fn deny_approval(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn models(State(state): State<ApiState>) -> Json<Value> {
+async fn models(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     let value = &state.app.config().model.routes;
-    Json(json!({"default":value.default,"large":value.large,"vision":value.vision}))
+    let items = state.app.selectable_models()?;
+    let default = value
+        .default
+        .as_ref()
+        .filter(|id| items.contains(id))
+        .unwrap_or(&items[0]);
+    Ok(Json(
+        json!({"default":default,"large":value.large,"vision":value.vision,"items":items}),
+    ))
 }
 async fn model_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     serde_json::to_value(state.app.model_status().await?)
@@ -511,6 +526,50 @@ async fn workspace_tree(
     }
     Ok(Json(json!({"items":entries})))
 }
+async fn workspace_image(
+    State(state): State<ApiState>,
+    Query(query): Query<SessionQuery>,
+) -> Result<Response, ApiError> {
+    use tokio::io::AsyncReadExt;
+    let path = query.path.ok_or_else(|| bad_request("path is required"))?;
+    let guard = session_guard(&state, &query.session_id).await?;
+    let resolved = guard.resolve_existing(&path).map_err(security)?;
+    let limits = state.app.config().vision.clone();
+    let file = tokio::fs::File::open(resolved).await.map_err(internal)?;
+    let mut bytes = Vec::new();
+    file.take(limits.max_file_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(internal)?;
+    if bytes.len() > limits.max_file_bytes {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image_too_large",
+            path,
+        ));
+    }
+    let decoded =
+        tokio::task::spawn_blocking(move || agent_vision::decode_image(path, None, bytes, &limits))
+            .await
+            .map_err(internal)?
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "invalid_image",
+                    e.to_string(),
+                )
+            })?;
+    Ok((
+        [
+            ("content-type", decoded.mime_type),
+            ("x-content-type-options", "nosniff".into()),
+            ("cache-control", "private, no-store".into()),
+        ],
+        decoded.bytes,
+    )
+        .into_response())
+}
+
 async fn workspace_file(
     State(state): State<ApiState>,
     Query(query): Query<SessionQuery>,
@@ -574,6 +633,11 @@ async fn openapi() -> Json<Value> {
     Json(openapi_document())
 }
 const OPENAPI_OPERATIONS: &[(&str, &str, &str)] = &[
+    (
+        "get",
+        "/api/v1/workspace/image",
+        "Read a bounded workspace image",
+    ),
     (
         "post",
         "/api/v1/sessions",
@@ -708,6 +772,48 @@ mod tests {
     #[test]
     fn uploaded_names_are_confined() {
         assert_eq!(safe_filename("../../secret.md"), ".._.._secret.md");
+    }
+
+    #[tokio::test]
+    async fn image_endpoint_rejects_escape_and_non_images() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let mut config = AppConfig::default();
+        config.security.workspace_root = temp.path().join("workspace");
+        config.storage.database_path = temp.path().join("veyra.db");
+        config.logging.directory = temp.path().join("logs");
+        let service = ApplicationService::open(config).await?;
+        let session = service.create_session(Some(".")).await?;
+        std::fs::write(temp.path().join("workspace/fake.png"), b"not an image")?;
+        let app = router(service, Some("secret".into()), temp.path());
+        for (path, expected) in [
+            ("..%2Fveyra.db", StatusCode::BAD_REQUEST),
+            ("fake.png", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v1/workspace/image?session_id={session}&path={path}"
+                        ))
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), expected);
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/workspace/image?session_id={session}&path=fake.png"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
     }
 
     #[test]

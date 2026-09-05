@@ -11,6 +11,7 @@ agent-document = { path = "../../crates/agent-document" }
 agent-security = { path = "../../crates/agent-security" }
 agent-storage = { path = "../../crates/agent-storage" }
 agent-tools = { path = "../../crates/agent-tools" }
+agent-vision = { path = "../../crates/agent-vision" }
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true

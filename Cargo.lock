@@ -224,6 +224,7 @@ dependencies = [
  "agent-security",
  "agent-storage",
  "agent-tools",
+ "agent-vision",
  "axum",
  "chrono",
  "clap",

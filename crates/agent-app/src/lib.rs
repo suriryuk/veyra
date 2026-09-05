@@ -126,6 +126,7 @@ pub struct AgentSection {
 pub struct ModelSection {
     pub base_url: String,
     pub model: String,
+    pub catalog_path: PathBuf,
     pub context_size: usize,
     pub request_timeout_seconds: u64,
     pub sampling: SamplingSection,
@@ -223,6 +224,7 @@ impl Default for ModelSection {
         Self {
             base_url: "http://127.0.0.1:8080/v1".into(),
             model: "Qwen3-Coder-30B-A3B-Instruct".into(),
+            catalog_path: PathBuf::from("config/llama-models.ini"),
             context_size: 32768,
             request_timeout_seconds: 300,
             sampling: SamplingSection::default(),
@@ -459,6 +461,26 @@ impl ApplicationService {
         message: String,
         profile: Option<ContextProfileChoice>,
     ) -> Result<StartedTask, AppError> {
+        self.start_task_with_model(session, message, profile, None)
+            .await
+    }
+
+    pub async fn start_task_with_model(
+        &self,
+        session: SessionId,
+        message: String,
+        profile: Option<ContextProfileChoice>,
+        model: Option<String>,
+    ) -> Result<StartedTask, AppError> {
+        let mut config = (*self.config).clone();
+        if let Some(model) = model {
+            if !self.selectable_models()?.contains(&model) {
+                return Err(AppError::Config("unknown text model".into()));
+            }
+            config.model.model = model.clone();
+            config.model.routes.default = Some(model.clone());
+            config.model.routes.large = Some(model);
+        }
         if message.trim().is_empty() {
             return Err(AppError::Config("message must not be empty".into()));
         }
@@ -500,7 +522,7 @@ impl ApplicationService {
             );
         }
         let bundle = match build_runner(
-            self.config.clone(),
+            Arc::new(config),
             self.database.clone(),
             workspace,
             session,
@@ -548,6 +570,12 @@ impl ApplicationService {
 
     pub async fn resolve_approval(&self, id: ApprovalId, allow: bool) -> Result<(), AppError> {
         self.approvals.resolve(id, allow).await
+    }
+
+    pub fn selectable_models(&self) -> Result<Vec<String>, AppError> {
+        let text = std::fs::read_to_string(&self.config.model.catalog_path)
+            .map_err(|e| AppError::Config(format!("model catalog: {e}")))?;
+        parse_model_catalog(&text)
     }
 
     pub async fn model_status(&self) -> Result<ModelFleetHealth, AppError> {
@@ -952,9 +980,50 @@ fn apply_overrides(mut limits: CommandLimits, value: &CommandLimitOverrides) -> 
     limits
 }
 
+fn parse_model_catalog(text: &str) -> Result<Vec<String>, AppError> {
+    let mut models = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if !line.starts_with('[') {
+            continue;
+        }
+        let Some(end) = line.find(']') else {
+            return Err(AppError::Config("invalid model catalog section".into()));
+        };
+        let name = line[1..end].trim();
+        if name == "*" {
+            continue;
+        }
+        if name.is_empty() || models.iter().any(|existing| existing == name) {
+            return Err(AppError::Config(
+                "empty or duplicate model catalog section".into(),
+            ));
+        }
+        models.push(name.to_owned());
+    }
+    if models.is_empty() {
+        return Err(AppError::Config("model catalog has no models".into()));
+    }
+    Ok(models)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_uses_router_ids_and_rejects_ambiguity() -> Result<(), AppError> {
+        assert_eq!(
+            parse_model_catalog(
+                "version = 1\n[*]\nx = 1\n[coding-default]\nmodel = x.gguf\n[vision]\nmmproj = y.gguf"
+            )?,
+            vec!["coding-default", "vision"]
+        );
+        assert!(parse_model_catalog("[*]").is_err());
+        assert!(parse_model_catalog("[broken").is_err());
+        assert!(parse_model_catalog("[same]\n[same]").is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn session_workspace_is_confined_to_the_allowed_root()
